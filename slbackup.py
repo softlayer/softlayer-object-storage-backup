@@ -20,6 +20,15 @@ _DEFAULT_CONFIG=os.path.expanduser('~/.slbackup')
 _DEFAULT_THREADS=cpu_count()
 _DEFAULT_DC='dal05'
 _DEFAULT_USE_PRIVATE=False
+_DEFAULT_OS_BUFLEN=1024
+
+try:
+    import resource
+except ImportError:
+    # well, must be windows, assume an 8MB slab
+    _DEFAULT_OS_BUFLEN=8*1024*1024
+else:
+    _DEFAULT_OS_BUFLEN=resource.getpagesize()
 
 USERNAME=None
 APIKEY=None
@@ -241,18 +250,23 @@ def process_files(_container, objects, files, backlog):
                 break
 
         if cursize == oldsize and oldtime >= curdate and not USE_CHECKHASH:
+            l.debug("No change in filesize/date: %s", _file)
             del objects[safe_filename]
             continue
-        else:
-            l.info("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
-                    oldsize, cursize, oldtime, curdate, safe_filename)
-
-        if USE_CHECKHASH:
+        elif USE_CHECKHASH:
+            l.info("Checksumming %s", _file)
             newhash = swifthash(_file)
 
             if oldhash == newhash:
+                l.debug("No change in checksum: %s", _file)
                 del objects[safe_filename]
                 continue
+            else:
+                l.info("Revised: HASH:%s:%s FILE:%s",
+                        oldhash, newhash, safe_filename)
+        else:
+            l.info("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
+                    oldsize, cursize, oldtime, curdate, safe_filename)
 
         new_revision(_container, _file, oldhash)
         backlog.put((_file, safe_filename))
@@ -274,8 +288,8 @@ def new_revision(_container, _from, marker):
     _rev_container = _container + "-revisions"
 
     safe_filename = encode_filename(_from)
-    fs = safe_filename.split('.')
-    new_file = ".".join(fs[0:-1]) + "_" + marker + "." + fs[-1]
+    fs = os.path.splitext(safe_filename)
+    new_file = fs[0] + "_" + marker + fs[1]
 
     container = get_container(_container)
     revcontainer = get_container(_rev_container)
@@ -329,8 +343,8 @@ def upload_files(_container, jobs):
 
 def chunk_upload(obj, filename, headers=None):
     upload = obj.chunk_upload(headers=headers)
-    with open(filename) as _f:
-        for line in _f:
+    with open(filename, 'rb') as _f:
+        for line in asblocks(_f):
             upload.send(line)
         upload.finish()
 
@@ -349,17 +363,29 @@ def swifthash(_f):
     """ Compute md5 of the file for comparison """
 
     m = md5()
-    with open(_f) as data:
-        # make sure the file is synced out to the disk
-        try:
-            data.flush()
-        except IOError:
-            pass
-
-        for line in data:
+    with open(_f, 'rb') as data:
+        for line in asblocks(data):
             m.update(line)
 
     return m.hexdigest()
+
+
+def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
+    """Generator that yields buflen bytes from an open filehandle.
+    Yielded bytes might be less buflen.  Does not raise excepts for 
+    IOError"""
+    if not isinstance(_f, file):
+        raise TypeError("First parameter must be an file object")
+
+    try:
+        while True:
+            data = _f.read(buflen)
+            if data:
+                yield data
+            else:
+                break
+    except IOError, e:
+        logging.error("Failed to read %d bytes: %s", buflen, e)
 
 
 def configure_globals(options):
@@ -437,23 +463,23 @@ def configure_globals(options):
     # CLI overrides config file
     if options.get('datacenter', None) is not None:
         DC = options['datacenter']
-        logging.info("Override: Using datacenter: %s", DC)
+        logging.warn("Override: Using datacenter: %s", DC)
 
     if options.get('internal', None) is not None:
         DC_USE_PRIVATE = True
-        logging.info("Override: Enabling private backend network endpoint.")
+        logging.warn("Override: Enabling private backend network endpoint.")
 
     if options.get('checksum', None) is not None:
         USE_CHECKHASH = True
-        logging.info("Override: Enabling checksum validation.")
+        logging.warn("Override: Enabling checksum validation.")
 
     if options.get('retention', None) is not None:
         RETENTION_DAYS = options['retention']
-        logging.info("Override: Setting retention days to %d", RETENTION_DAYS)
+        logging.warn("Override: Setting retention days to %d", RETENTION_DAYS)
 
     if options.get('threads', None) is not None:
         THREADS = options['threads']
-        logging.info("Override: Setting threads to %d", THREADS)
+        logging.warn("Override: Setting threads to %d", THREADS)
 
     if options.get('xf', None) is not None:
         with open(options['xf'], 'r') as x:
@@ -465,6 +491,7 @@ def configure_globals(options):
             EXCLUDES.append(x)
 
     logging.info("Excluding: %s", EXCLUDES)
+
 
 if __name__ == "__main__":
     import optparse
