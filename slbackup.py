@@ -1,4 +1,17 @@
 #!/usr/bin/python
+
+
+""" SoftLayer object storage backup """
+
+__author__ = "Kevin Landreth"
+__copyright__ = "Copyright 2012, SoftLayer"
+__credits__ = ["Kevin Landreth", "Kevin McDonald", "Chris Evans"]
+__license__ = "MIT"
+__version__ = "1.0"
+__maintainer__ = "Kevin Landreth"
+__email__ = "klandreth@softlayer.com"
+__status__ = "Production"
+
 import os
 import sys
 import time
