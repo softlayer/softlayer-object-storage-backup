@@ -16,7 +16,7 @@ except ImportError:
 
 _DEFAULT_RETENTION=30
 _DEFAULT_CHECKHASH=False
-_DEFAULT_CONFIG=os.path.join(os.path.expanduser('~'), '.slbackup')
+_DEFAULT_CONFIG=os.path.expanduser('~/.slbackup')
 _DEFAULT_THREADS=cpu_count()
 _DEFAULT_DC='dal05'
 _DEFAULT_USE_PRIVATE=False
@@ -547,12 +547,10 @@ if __name__ == "__main__":
     configure_globals(opts)
 
     if not hasattr(opts, 'source') or not opts.source:
-        logging.fatal("Need to specify --source")
-        raise ValueError("Need to specify --source")
+        args.error("Missing parameter: --source")
 
     if not hasattr(opts, 'container') or not opts.source:
-        logging.fatal("Need to specify --container")
-        raise ValueError("Need to specify --container")
+        args.error("Missing parameter: --container")
 
     logging.config.fileConfig(opts.config)
     os.chdir(opts.source)
