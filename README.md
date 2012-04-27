@@ -21,11 +21,11 @@ comparisions using this hash instead of time/size variance.
 Usage
 =====
 
-# Download/install object_storage from github
-# Download slbackup.py
-# run ```./slbackup.py --help```
-# run ```./slbackup.py --example``` to get a config
-# run with the desired options.
+. Download/install object_storage from github
+. Download slbackup.py
+. run ```./slbackup.py --help```
+. run ```./slbackup.py --example``` to get a config
+. run with the desired options.
 
 Known issues/limitations
 ========================
