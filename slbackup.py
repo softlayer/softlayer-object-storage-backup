@@ -38,8 +38,9 @@ _DEFAULT_OS_BUFLEN=1024
 try:
     import resource
 except ImportError:
-    # well, must be windows, assume an 8MB slab
-    _DEFAULT_OS_BUFLEN=8*1024*1024
+    # well, must be windows, assume an 4Kb slab
+    # regardless if long mode is supported
+    _DEFAULT_OS_BUFLEN=4*1024
 else:
     _DEFAULT_OS_BUFLEN=resource.getpagesize()
 
