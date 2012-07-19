@@ -21,17 +21,25 @@ comparisions using this hash instead of time/size variance.
 Usage
 =====
 
-. Download/install object_storage from github
-. Download slbackup.py
-. run ```./slbackup.py --help```
-. run ```./slbackup.py --example``` to get a config
-. run with the desired options.
+1. Download/install [object_storage](https://github.com/softlayer/softlayer-object-storage-python)
+2. Download slbackup.py
+3. run ```./slbackup.py --help```
+4. run ```./slbackup.py --example > ~/.slbackup``` to get a config
+5. run ```nano ~/.slbackup``` and put your credentials in there
+6. run with the desired options.
+
+I also [blogged about it](http://sldn.softlayer.com/blog/klandreth/Deglazing-slbackuppy-Usage-Object-Storage-Kitchen)
 
 Known issues/limitations
 ========================
 
-* 5GB file limitation: Swift does support (large files)[http://swift.openstack.org/overview_large_objects.html] 
+* Requires [python 2.6 or higher](https://github.com/softlayer/softlayer-object-storage-backup/issues/5).  Most modern distros should have this, but for the others, the 
+[python26 package](http://dl.fedoraproject.org/pub/epel/5/x86_64/repoview/python26.html) should help those 
+with production systems.
+* 5GB file limitation: Swift does support [large files](http://swift.openstack.org/overview_large_objects.html) 
 using Manifest files, but this script does not currently deal with this properly.  Not sure how to deal with
 object fragments during file comparision.  Uploading and making the manifests is easy.
 * Windows Support:  Tried to write the script in a way that supported windows.  However, it is not tested yet.
-* Restoration: Restoring files is an operation left to the admin right now.
+* Restoration: Restoring files is an operation left to the admin right now. 
+[FUSE is handy](https://github.com/redbo/cloudfuse) for that kine of work.
+
