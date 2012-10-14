@@ -7,7 +7,7 @@ __author__ = "Kevin Landreth"
 __copyright__ = "Copyright 2012, SoftLayer"
 __credits__ = ["Kevin Landreth", "Kevin McDonald", "Chris Evans"]
 __license__ = "MIT"
-__version__ = "1.0"
+__version__ = "1.1"
 __maintainer__ = "Kevin Landreth"
 __email__ = "klandreth@softlayer.com"
 __status__ = "Production"
@@ -27,30 +27,30 @@ except ImportError:
     print "  https://github.com/softlayer/softlayer-object-storage-python"
     sys.exit(1)
 
-_DEFAULT_RETENTION=30
-_DEFAULT_CHECKHASH=False
-_DEFAULT_CONFIG=os.path.expanduser('~/.slbackup')
-_DEFAULT_THREADS=cpu_count()
-_DEFAULT_DC='dal05'
-_DEFAULT_USE_PRIVATE=False
-_DEFAULT_OS_BUFLEN=1024
+_DEFAULT_RETENTION = 30
+_DEFAULT_CHECKHASH = False
+_DEFAULT_CONFIG = os.path.expanduser('~/.slbackup')
+_DEFAULT_THREADS = cpu_count()
+_DEFAULT_DC = 'dal05'
+_DEFAULT_USE_PRIVATE = False
+_DEFAULT_OS_BUFLEN = 1024
 
 try:
     import resource
 except ImportError:
     # well, must be windows, assume an 4Kb slab
     # regardless if long mode is supported
-    _DEFAULT_OS_BUFLEN=4*1024
+    _DEFAULT_OS_BUFLEN = 4 * 1024
 else:
-    _DEFAULT_OS_BUFLEN=resource.getpagesize()
+    _DEFAULT_OS_BUFLEN = resource.getpagesize()
 
-USERNAME=None
-APIKEY=None
-DC=_DEFAULT_DC
-DC_USE_PRIVATE=_DEFAULT_USE_PRIVATE
-USE_CHECKHASH=_DEFAULT_CHECKHASH
-THREADS=_DEFAULT_THREADS
-RETENTION_DAYS=_DEFAULT_RETENTION
+USERNAME = None
+APIKEY = None
+DC = _DEFAULT_DC
+DC_USE_PRIVATE = _DEFAULT_USE_PRIVATE
+USE_CHECKHASH = _DEFAULT_CHECKHASH
+THREADS = _DEFAULT_THREADS
+RETENTION_DAYS = _DEFAULT_RETENTION
 EXCLUDES = list()
 
 
@@ -58,8 +58,10 @@ def get_container(name):
     global DC, USERNAME, APIKEY, DC_USE_PRIVATE
 
     use_network = 'private' if DC_USE_PRIVATE else 'public'
-    logging.info("Logging in as %s in %s and getting container %s", USERNAME, DC, name)
-    obj = object_storage.get_client(USERNAME, APIKEY, datacenter=DC, network=use_network)
+    logging.info("Logging in as %s in %s and getting container %s",
+            USERNAME, DC, name)
+    obj = object_storage.get_client(
+            USERNAME, APIKEY, datacenter=DC, network=use_network)
     return obj[name]
 
 
@@ -69,12 +71,12 @@ def catalog_directory(directory, files, directories):
     for root, dirnames, filenames in os.walk('.'):
         # Prune all excluded directories from the list
         for a in EXCLUDES:
-            b,p = os.path.split(a)
+            b, p = os.path.split(a)
             if p in dirnames:
                 if len(b) < 1:
                     logging.info("Pruning %s", a)
                     dirnames.remove(p)
-                elif root.find('./'+b) == 0:
+                elif root.find('./' + b) == 0:
                     logging.info("Pruning %s", a)
                     dirnames.remove(p)
 
@@ -144,13 +146,13 @@ def upload_directory(_container, directory):
     # For each scanner, create an backlog manager as we don't want the http
     # backlog to grow too long and uploading/deleting will take 2-4x as long
     for p in xrange(THREADS):
-       pool.append(Process(target=process_files,
+        pool.append(Process(target=process_files,
            args=(_container, remote_objects, files, uploads)))
-       if (p % 2) == 0:
-           workers.append(Process(target=upload_files,
+        if (p % 2) == 0:
+            workers.append(Process(target=upload_files,
                args=(_container, uploads)))
-       else:
-           workers.append(Process(target=delete_files,
+        else:
+            workers.append(Process(target=delete_files,
                args=(deletes,)))
 
     logging.warn("Processing %d files (%d reads/%d writers)",
@@ -171,7 +173,6 @@ def upload_directory(_container, directory):
     for s in pool:
         s.join()
 
-
     # After the readers have all exited, we know that remote_objects
     # contains the remaining files that should be deleted from
     # the backups.  Dump these into a Queue for the writers to take
@@ -182,7 +183,7 @@ def upload_directory(_container, directory):
 
     logging.info("Stopping uploaders")
     # tell the uploaders they are done
-    for x in xrange(len(workers)/2):
+    for x in xrange(len(workers) / 2):
         uploads.put(None)
         deletes.put(None)
 
@@ -269,7 +270,7 @@ def process_files(_container, objects, files, backlog):
         oldtime = objects[safe_filename].get('last_modified')
 
         # there are a few formats, try to figure out which one safely
-        for timeformat in [ '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S']:
+        for timeformat in ['%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S']:
             try:
                 oldtime = time.mktime(time.strptime(oldtime,
                     '%Y-%m-%dT%H:%M:%S.%f'))
@@ -303,12 +304,12 @@ def process_files(_container, objects, files, backlog):
 
 
 def new_revision(_container, _from, marker):
+    global RETENTION_DAYS
+
     # copy the file to the -revisions container so we don't
     # pollute the deleted items list.  Not putting revisions
     # in a seperate container will lead to an ever growing
     # list slowing down the backups
-
-    global RETENTION_DAYS
 
     if RETENTION_DAYS < 1:
         logging.info("Retention disabled for %s", _from)
@@ -346,8 +347,7 @@ def delete_later(obj):
     when = int(time.time()) + delta
     logging.info("Setting retention(%d) on %s", when, obj.name)
 
-
-    headers={
+    headers = {
         'X-Delete-At': str(when),
         'Content-Length': '0'}
     obj.make_request('POST', headers=headers)
@@ -359,7 +359,7 @@ def upload_files(_container, jobs):
     l = logging.getLogger('upload_files')
     while True:
         try:
-            _file,target = jobs.get()
+            _file, target = jobs.get()
         except:
             logging.info("Uploader exiting")
             break
@@ -401,7 +401,7 @@ def swifthash(_f):
 
 def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
     """Generator that yields buflen bytes from an open filehandle.
-    Yielded bytes might be less buflen.  Does not raise excepts for 
+    Yielded bytes might be less buflen.  Does not raise excepts for
     IOError"""
     if not isinstance(_f, file):
         raise TypeError("First parameter must be an file object")
@@ -434,7 +434,7 @@ def configure_globals(options):
             'threads': _DEFAULT_THREADS,
             'retention': _DEFAULT_RETENTION,
             }
-    for k,v in defaults.iteritems():
+    for k, v in defaults.iteritems():
         if k == 'example':
             continue
         defaults[k] = str(v)
@@ -443,9 +443,9 @@ def configure_globals(options):
     defaults['apikey'] = 'MISSING'
 
     if options['example']:
-        c  = ConfigParser.SafeConfigParser()
+        c = ConfigParser.SafeConfigParser()
         c.add_section("slbackup")
-        for k,v in defaults.iteritems():
+        for k, v in defaults.iteritems():
             if k in ['container', 'source', 'example', 'config']:
                 continue
             c.set("slbackup", k, v)
@@ -528,15 +528,15 @@ if __name__ == "__main__":
     # using argparse would have been preferred but that requires python >=2.7
     # ideally this will work in 2.5, but certianly 2.6
     args = optparse.OptionParser(
-            'slbackup -s PATH -o CONTAINER [....]'
-           "\n\n"
-           'SoftLayer rsync-like object storage backup script',
-            epilog="WARNING: this script uses mutliprocessing from python to "
-            "reduce high latency HTTP round trip times."
-            "It spawns on local file reader per thread (-t) and on "
-            "uploader/deleter for every 2 readers."
-            "Take this into consideration when specifying the -t option "
-            "as the number is essentially doubled.")
+        'slbackup -s PATH -o CONTAINER [....]'
+        "\n\n"
+        'SoftLayer rsync-like object storage backup script',
+        epilog="WARNING: this script uses mutliprocessing from python to "
+        "reduce high latency HTTP round trip times."
+        "It spawns on local file reader per thread (-t) and on "
+        "uploader/deleter for every 2 readers."
+        "Take this into consideration when specifying the -t option "
+        "as the number is essentially doubled.")
 
     args.add_option('-s', '--source', nargs=1, type="str",
             help='The directory to backup', metavar="/home")
@@ -545,9 +545,9 @@ if __name__ == "__main__":
     args.add_option('-c', '--config', nargs=1, type="str",
             default=_DEFAULT_CONFIG,
             help='Configuration file containing login credintials.'
-            ' Optional, but a configuration file must exist at %s' % \
-                    _DEFAULT_CONFIG
-            , metavar=_DEFAULT_CONFIG)
+            ' Optional, but a configuration file must exist at %s' %
+                    _DEFAULT_CONFIG,
+                    metavar=_DEFAULT_CONFIG)
     args.add_option('--example', action="store_true", default=False,
             help="Print an example config and exit.")
 
@@ -561,14 +561,14 @@ if __name__ == "__main__":
             help='Days of retention to keep updated and deleted files.'
             ' This will create a backupContainer-revisions container.'
             ' Set to 0 to delete and overwrite files immediately.'
-            ' (default: %s)' % _DEFAULT_RETENTION , metavar=_DEFAULT_RETENTION)
+            ' (default: %s)' % _DEFAULT_RETENTION, metavar=_DEFAULT_RETENTION)
 
     oargs.add_option('-t', '--threads', nargs=1, type="int",
             help='Number of threads to spawn.'
             'The number spawned will be two times this number.'
             'If in doubt, the default of %d will be used, resulting'
             'in %d threads on this system.' % (_DEFAULT_THREADS,
-                _DEFAULT_THREADS*2), metavar=_DEFAULT_THREADS)
+                _DEFAULT_THREADS * 2), metavar=_DEFAULT_THREADS)
 
     oargs.add_option('-z', '--checksum', action='store_true',
             help='Use md5 checksums instead of time/size comparison. '
@@ -595,7 +595,6 @@ if __name__ == "__main__":
             type="str", default=None, metavar="FILE",
             help="File including a line seperated list of directories.")
 
-
     args.add_option_group(oargs)
     args.add_option_group(xargs)
     (opts, extra) = args.parse_args()
@@ -611,5 +610,3 @@ if __name__ == "__main__":
     logging.config.fileConfig(opts.config)
     os.chdir(opts.source)
     upload_directory(opts.container, opts.source)
-
-
