@@ -363,11 +363,19 @@ def upload_files(_container, jobs):
         except:
             logging.info("Uploader exiting")
             break
-        obj = container.storage_object(target)
-        obj.create()
-        l.warn("Uploading file %s", obj.name)
-        chunk_upload(obj, _file)
-        l.warn("Finished file %s ", obj.name)
+
+        try:
+            obj = container.storage_object(target)
+            obj.create()
+            l.warn("Uploading file %s", obj.name)
+            chunk_upload(obj, _file)
+            l.warn("Finished file %s ", obj.name)
+        except Exception, e:
+            l.error("Failed to upload %s, requeueing", _file)
+            l.exception(e)
+            jobs.put((_file, target,))
+            # in case we got disconnected, reset the container
+            container = get_container(_container)
 
 
 def chunk_upload(obj, filename, headers=None):
