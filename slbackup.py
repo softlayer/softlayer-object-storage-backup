@@ -50,7 +50,7 @@ class Application(object):
 
     def __init__(self, options):
         if not isinstance(options, dict):
-            options = options.__dict__()
+            options = options.__dict__
 
         # config parser expects str() values
         defaults = {
@@ -336,13 +336,14 @@ def delete_files(app, objects):
                     obj['name'], obj.get('hash', 'deleted'))
 
             # then delete it as it no longer exists.
-            rm = get_container(app, _container).storage_object(obj['name'])
+            rm = get_container(app, name=_container)\
+                .storage_object(obj['name'])
             rm.delete()
         except:
             break
 
 
-def process_files(app, _container, objects, files, backlog):
+def process_files(app, objects, files, backlog):
     l = logging.getLogger('process_files')
     while True:
         try:
@@ -396,11 +397,11 @@ def process_files(app, _container, objects, files, backlog):
                     oldsize, cursize, oldtime, curdate, safe_filename)
 
         del objects[safe_filename]
-        new_revision(_container, _file, oldhash)
+        new_revision(app, _file, oldhash)
         backlog.put((_file, safe_filename,))
 
 
-def new_revision(app, _container, _from, marker):
+def new_revision(app, _from, marker):
     if app.retention < 1:
         logging.info("Retention disabled for %s", _from)
         return None
@@ -410,14 +411,14 @@ def new_revision(app, _container, _from, marker):
     # in a seperate container will lead to an ever growing
     # list slowing down the backups
 
-    _rev_container = _container + "-revisions"
+    _rev_container = app.container + "-revisions"
 
     safe_filename = encode_filename(_from)
     fs = os.path.splitext(safe_filename)
     new_file = fs[0] + "_" + marker + fs[1]
 
-    container = get_container(app, _container)
-    revcontainer = get_container(app, _rev_container)
+    container = get_container(app)
+    revcontainer = get_container(app, name=_rev_container)
     revcontainer.create()
 
     obj = container.storage_object(safe_filename)
@@ -447,7 +448,7 @@ def delete_later(app, obj):
 
 
 def upload_files(_container, jobs):
-    container = get_container(app, _container)
+    container = get_container(app, name=_container)
 
     l = logging.getLogger('upload_files')
     while True:
@@ -468,7 +469,7 @@ def upload_files(_container, jobs):
             l.exception(e)
             jobs.put((_file, target,))
             # in case we got disconnected, reset the container
-            container = get_container(app, _container)
+            container = get_container(app, name=_container)
 
 
 def chunk_upload(obj, filename, headers=None):
