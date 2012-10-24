@@ -599,13 +599,13 @@ if __name__ == "__main__":
     args.add_option_group(xargs)
     (opts, extra) = args.parse_args()
 
+    app = Application(opts)
+
     if not hasattr(opts, 'source') or not opts.source:
         args.error("Missing parameter: --source")
 
-    if not hasattr(opts, 'container') or not opts.source:
+    if not hasattr(opts, 'container') or not opts.container:
         args.error("Missing parameter: --container")
-
-    app = Application(opts)
 
     logging.config.fileConfig(opts.config)
     os.chdir(app.source)
