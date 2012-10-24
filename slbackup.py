@@ -17,6 +17,8 @@ import sys
 import time
 import logging
 import logging.config
+import ConfigParser
+from copy import copy
 from hashlib import md5
 from multiprocessing import Manager, Process, cpu_count
 
@@ -27,14 +29,6 @@ except ImportError:
     print "  https://github.com/softlayer/softlayer-object-storage-python"
     sys.exit(1)
 
-_DEFAULT_RETENTION = 30
-_DEFAULT_CHECKHASH = False
-_DEFAULT_CONFIG = os.path.expanduser('~/.slbackup')
-_DEFAULT_THREADS = cpu_count()
-_DEFAULT_DC = 'dal05'
-_DEFAULT_USE_PRIVATE = False
-_DEFAULT_OS_BUFLEN = 1024
-
 try:
     import resource
 except ImportError:
@@ -44,33 +38,137 @@ except ImportError:
 else:
     _DEFAULT_OS_BUFLEN = resource.getpagesize()
 
-USERNAME = None
-APIKEY = None
-DC = _DEFAULT_DC
-DC_USE_PRIVATE = _DEFAULT_USE_PRIVATE
-USE_CHECKHASH = _DEFAULT_CHECKHASH
-THREADS = _DEFAULT_THREADS
-RETENTION_DAYS = _DEFAULT_RETENTION
-EXCLUDES = list()
+
+class Application(object):
+    _DEFAULT_RETENTION = 30
+    _DEFAULT_CHECKHASH = False
+    _DEFAULT_CONFIG = os.path.expanduser('~/.slbackup')
+    _DEFAULT_THREADS = cpu_count()
+    _DEFAULT_DC = 'dal05'
+    _DEFAULT_USE_PRIVATE = False
+    _DEFAULT_OS_BUFLEN = 1024
+
+    def __init__(self, options):
+        if not isinstance(options, dict):
+            options = options.__dict__
+
+        # config parser expects str() values
+        defaults = {
+                'datacenter': self._DEFAULT_DC,
+                'internal': self._DEFAULT_USE_PRIVATE,
+                'checksum': self._DEFAULT_CHECKHASH,
+                'threads': self._DEFAULT_THREADS,
+                'retention': self._DEFAULT_RETENTION,
+                }
+        for k, v in defaults.iteritems():
+            if k == 'example':
+                continue
+            defaults[k] = str(v)
+
+        defaults['username'] = 'MISSING'
+        defaults['apikey'] = 'MISSING'
+
+        if options['example']:
+            c = ConfigParser.SafeConfigParser()
+            c.add_section("slbackup")
+            for k, v in defaults.iteritems():
+                if k in ['container', 'source', 'example', 'config']:
+                    continue
+                c.set("slbackup", k, v)
+
+            c.add_section("loggers")
+            c.set("loggers", "keys", "root")
+
+            c.add_section("handlers")
+            c.set("handlers", "keys", "defhandler")
+
+            c.add_section("formatters")
+            c.set("formatters", "keys", "defformatter")
+
+            c.add_section("logger_root")
+            c.set("logger_root", "level", "NOTSET")
+            c.set("logger_root", "handlers", "defhandler")
+
+            c.add_section("handler_defhandler")
+            c.set("handler_defhandler", "class", "StreamHandler")
+            c.set("handler_defhandler", "level", "WARN")
+            c.set("handler_defhandler", "formatter", "defformatter")
+            c.set("handler_defhandler", "args", "(sys.stdout,)")
+
+            c.add_section("formatter_defformatter")
+            c.set("formatter_defformatter", "format",
+                    "%(asctime)s|%(levelname)s|%(name)s %(message)s")
+            c.set("formatter_defformatter", "datefmt", "")
+            c.set("formatter_defformatter", "class", "logging.Formatter")
+
+            c.write(sys.stdout)
+            sys.exit(0)
+
+        c = ConfigParser.SafeConfigParser(defaults)
+        c.read(options['config'])
+
+        self.username = c.get('slbackup', 'username')
+        self.apikey = c.get('slbackup', 'apikey')
+        self.dc = c.get('slbackup', 'datacenter')
+        self.use_private = c.getboolean('slbackup', 'internal')
+        self.checkhash = c.getboolean('slbackup', 'checksum')
+        self.retention = c.getint('slbackup', 'retention')
+        self.threads = c.getint('slbackup', 'threads')
+        self.excludes = []
+        self.source = options.get('source')
+        self.container = options.get('container')
+
+        # CLI overrides config file
+        if options.get('datacenter', None) is not None:
+            self.dc = options['datacenter']
+            logging.warn("Override: Using datacenter: %s", self.dc)
+
+        if options.get('internal', None) is not None:
+            self.use_private = True
+            logging.warn("Override: Enabling private backend "
+                "network endpoint.")
+
+        if options.get('checksum', None) is not None:
+            self.checkhash = True
+            logging.warn("Override: Enabling checksum validation.")
+
+        if options.get('retention', None) is not None:
+            self.retention = options['retention']
+            logging.warn("Override: Setting retention days to %d",
+                    self.retention)
+
+        if options.get('threads', None) is not None:
+            self.threads = options['threads']
+            logging.warn("Override: Setting threads to %d", self.threads)
+
+        if options.get('xf', None) is not None:
+            with open(options['xf'], 'r') as x:
+                for l in x.readlines():
+                    self.excludes.append(l.strip())
+
+        if options.get('exclude', None) is not None:
+            for x in options['exclude']:
+                self.excludes.append(x)
+
+        logging.info("Excluding: %s", self.excludes)
 
 
-def get_container(name):
-    global DC, USERNAME, APIKEY, DC_USE_PRIVATE
-
-    use_network = 'private' if DC_USE_PRIVATE else 'public'
+def get_container(app, name=None):
+    if name is None:
+        name = app.container
+    use_network = 'private' if app.use_private else 'public'
     logging.info("Logging in as %s in %s and getting container %s",
-            USERNAME, DC, name)
+            app.username, app.dc, name)
     obj = object_storage.get_client(
-            USERNAME, APIKEY, datacenter=DC, network=use_network)
+            app.username, app.apikey, datacenter=app.dc, network=use_network)
     return obj[name]
 
 
-def catalog_directory(directory, files, directories):
+def catalog_directory(app, directory, files, directories):
     logging.warn("Gathering local files")
-    global EXCLUDES
     for root, dirnames, filenames in os.walk('.'):
         # Prune all excluded directories from the list
-        for a in EXCLUDES:
+        for a in app.excludes:
             b, p = os.path.split(a)
             if p in dirnames:
                 if len(b) < 1:
@@ -89,9 +187,9 @@ def catalog_directory(directory, files, directories):
     logging.warn("Done gathering local files")
 
 
-def catalog_remote(_container, objects):
+def catalog_remote(app, objects):
     logging.warn("Grabbing remote objects")
-    container = get_container(_container)
+    container = get_container(app)
     container.create()
     f = container.objects()
     while True:
@@ -110,7 +208,7 @@ def catalog_remote(_container, objects):
     logging.warn("Objects %d", len(objects))
 
 
-def upload_directory(_container, directory):
+def upload_directory(app):
     """ Uploads an entire local directory. """
     manager = Manager()
     directories = manager.Queue()
@@ -121,9 +219,9 @@ def upload_directory(_container, directory):
 
     harvest = list()
     harvest.append(Process(target=catalog_directory,
-        args=(directory, files, directories,)))
+        args=(copy(app), app.source, files, directories,)))
     harvest.append(Process(target=catalog_remote,
-        args=(_container, remote_objects,)))
+        args=(copy(app), remote_objects,)))
 
     logging.info("Starting harvesters")
     for harvester in harvest:
@@ -137,7 +235,7 @@ def upload_directory(_container, directory):
 
     # haven't needed to thread this out yet, but it's ready if it needs to
     logging.warn("Processing directories (%d)", directories.qsize())
-    create_directories(_container, directories, remote_objects)
+    create_directories(app, directories, remote_objects)
     del directories
 
     pool = list()
@@ -145,15 +243,15 @@ def upload_directory(_container, directory):
 
     # For each scanner, create an backlog manager as we don't want the http
     # backlog to grow too long and uploading/deleting will take 2-4x as long
-    for p in xrange(THREADS):
+    for p in xrange(app.threads):
         pool.append(Process(target=process_files,
-           args=(_container, remote_objects, files, uploads)))
+           args=(copy(app), remote_objects, files, uploads)))
         if (p % 2) == 0:
             workers.append(Process(target=upload_files,
-               args=(_container, uploads)))
+               args=(app.container, uploads)))
         else:
             workers.append(Process(target=delete_files,
-               args=(deletes,)))
+               args=(app, deletes,)))
 
     logging.warn("Processing %d files (%d reads/%d writers)",
             files.qsize(), len(pool), len(workers))
@@ -179,7 +277,7 @@ def upload_directory(_container, directory):
     # care of.
     logging.info("%d objects scheduled for deletion", len(remote_objects))
     for d in remote_objects.values():
-        deletes.put((_container, d))
+        deletes.put((app.container, d))
 
     logging.info("Stopping uploaders")
     # tell the uploaders they are done
@@ -192,7 +290,7 @@ def upload_directory(_container, directory):
     for s in workers:
         s.join()
 
-    logging.warn("Done backing up %s to %s", directory, _container)
+    logging.warn("Done backing up %s to %s", app.source, app.container)
 
 
 def encode_filename(string):
@@ -201,9 +299,9 @@ def encode_filename(string):
     return uc.encode('ascii', 'replace')
 
 
-def create_directories(_container, directories, remote_objects):
+def create_directories(app, directories, remote_objects):
     logging.info("Creating directories")
-    container = get_container(_container)
+    container = get_container(app)
     while True:
         try:
             _dir = directories.get_nowait()
@@ -226,7 +324,7 @@ def create_directories(_container, directories, remote_objects):
             del remote_objects[safe_dir]
 
 
-def delete_files(objects):
+def delete_files(app, objects):
     while True:
         try:
             _container, obj = objects.get()
@@ -234,18 +332,18 @@ def delete_files(objects):
             logging.info("Deleting %s", obj['name'])
 
             # Copy the file out of the way
-            new_revision(_container, obj['name'], obj.get('hash', 'deleted'))
+            new_revision(app, _container,
+                    obj['name'], obj.get('hash', 'deleted'))
 
             # then delete it as it no longer exists.
-            rm = get_container(_container).storage_object(obj['name'])
+            rm = get_container(app, name=_container)\
+                .storage_object(obj['name'])
             rm.delete()
         except:
             break
 
 
-def process_files(_container, objects, files, backlog):
-    global CHECKHASH
-
+def process_files(app, objects, files, backlog):
     l = logging.getLogger('process_files')
     while True:
         try:
@@ -279,11 +377,11 @@ def process_files(_container, objects, files, backlog):
             else:
                 break
 
-        if cursize == oldsize and oldtime >= curdate and not USE_CHECKHASH:
+        if cursize == oldsize and oldtime >= curdate and not app.checkhash:
             l.debug("No change in filesize/date: %s", _file)
             del objects[safe_filename]
             continue
-        elif USE_CHECKHASH:
+        elif app.checkhash:
             l.info("Checksumming %s", _file)
             newhash = swifthash(_file)
 
@@ -299,30 +397,28 @@ def process_files(_container, objects, files, backlog):
                     oldsize, cursize, oldtime, curdate, safe_filename)
 
         del objects[safe_filename]
-        new_revision(_container, _file, oldhash)
+        new_revision(app, _file, oldhash)
         backlog.put((_file, safe_filename,))
 
 
-def new_revision(_container, _from, marker):
-    global RETENTION_DAYS
+def new_revision(app, _from, marker):
+    if app.retention < 1:
+        logging.info("Retention disabled for %s", _from)
+        return None
 
     # copy the file to the -revisions container so we don't
     # pollute the deleted items list.  Not putting revisions
     # in a seperate container will lead to an ever growing
     # list slowing down the backups
 
-    if RETENTION_DAYS < 1:
-        logging.info("Retention disabled for %s", _from)
-        return None
-
-    _rev_container = _container + "-revisions"
+    _rev_container = app.container + "-revisions"
 
     safe_filename = encode_filename(_from)
     fs = os.path.splitext(safe_filename)
     new_file = fs[0] + "_" + marker + fs[1]
 
-    container = get_container(_container)
-    revcontainer = get_container(_rev_container)
+    container = get_container(app)
+    revcontainer = get_container(app, name=_rev_container)
     revcontainer.create()
 
     obj = container.storage_object(safe_filename)
@@ -334,16 +430,14 @@ def new_revision(_container, _from, marker):
         rev.create()
 
         obj.copy_to(rev)
-        delete_later(rev)
+        delete_later(app, rev)
 
 
-def delete_later(obj):
+def delete_later(app, obj):
     """ lacking this in the bindings currently, work around it.
         Deletes a file after the specified number of days
     """
-    global RETENTION_DAYS
-
-    delta = int(RETENTION_DAYS) * 24 * 60 * 60
+    delta = int(app.retention) * 24 * 60 * 60
     when = int(time.time()) + delta
     logging.info("Setting retention(%d) on %s", when, obj.name)
 
@@ -354,7 +448,7 @@ def delete_later(obj):
 
 
 def upload_files(_container, jobs):
-    container = get_container(_container)
+    container = get_container(app, name=_container)
 
     l = logging.getLogger('upload_files')
     while True:
@@ -374,7 +468,7 @@ def upload_files(_container, jobs):
             l.error("Failed to upload %s, requeueing", _file)
             jobs.put((_file, target,))
             # in case we got disconnected, reset the container
-            container = get_container(_container)
+            container = get_container(app, name=_container)
 
 
 def chunk_upload(obj, filename, headers=None):
@@ -424,111 +518,6 @@ def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
         logging.error("Failed to read %d bytes: %s", buflen, e)
 
 
-def configure_globals(options):
-    import ConfigParser
-    global USERNAME, APIKEY, DC, DC_USE_PRIVATE
-    global USE_CHECKHASH, RETENTION_DAYS, THREADS
-    global EXCLUDES
-
-    if not isinstance(options, dict):
-        options = options.__dict__
-
-    # config parser expects str() values
-    defaults = {
-            'datacenter': _DEFAULT_DC,
-            'internal': _DEFAULT_USE_PRIVATE,
-            'checksum': _DEFAULT_CHECKHASH,
-            'threads': _DEFAULT_THREADS,
-            'retention': _DEFAULT_RETENTION,
-            }
-    for k, v in defaults.iteritems():
-        if k == 'example':
-            continue
-        defaults[k] = str(v)
-
-    defaults['username'] = 'MISSING'
-    defaults['apikey'] = 'MISSING'
-
-    if options['example']:
-        c = ConfigParser.SafeConfigParser()
-        c.add_section("slbackup")
-        for k, v in defaults.iteritems():
-            if k in ['container', 'source', 'example', 'config']:
-                continue
-            c.set("slbackup", k, v)
-
-        c.add_section("loggers")
-        c.set("loggers", "keys", "root")
-
-        c.add_section("handlers")
-        c.set("handlers", "keys", "defhandler")
-
-        c.add_section("formatters")
-        c.set("formatters", "keys", "defformatter")
-
-        c.add_section("logger_root")
-        c.set("logger_root", "level", "NOTSET")
-        c.set("logger_root", "handlers", "defhandler")
-
-        c.add_section("handler_defhandler")
-        c.set("handler_defhandler", "class", "StreamHandler")
-        c.set("handler_defhandler", "level", "WARN")
-        c.set("handler_defhandler", "formatter", "defformatter")
-        c.set("handler_defhandler", "args", "(sys.stdout,)")
-
-        c.add_section("formatter_defformatter")
-        c.set("formatter_defformatter", "format",
-                "%(asctime)s|%(levelname)s|%(name)s %(message)s")
-        c.set("formatter_defformatter", "datefmt", "")
-        c.set("formatter_defformatter", "class", "logging.Formatter")
-
-        c.write(sys.stdout)
-        sys.exit(0)
-
-    c = ConfigParser.SafeConfigParser(defaults)
-    c.read(options['config'])
-
-    USERNAME = c.get('slbackup', 'username')
-    APIKEY = c.get('slbackup', 'apikey')
-    DC = c.get('slbackup', 'datacenter')
-    DC_USE_PRIVATE = c.getboolean('slbackup', 'internal')
-    USE_CHECKHASH = c.getboolean('slbackup', 'checksum')
-    RETENTION_DAYS = c.getint('slbackup', 'retention')
-    THREADS = c.getint('slbackup', 'threads')
-
-    # CLI overrides config file
-    if options.get('datacenter', None) is not None:
-        DC = options['datacenter']
-        logging.warn("Override: Using datacenter: %s", DC)
-
-    if options.get('internal', None) is not None:
-        DC_USE_PRIVATE = True
-        logging.warn("Override: Enabling private backend network endpoint.")
-
-    if options.get('checksum', None) is not None:
-        USE_CHECKHASH = True
-        logging.warn("Override: Enabling checksum validation.")
-
-    if options.get('retention', None) is not None:
-        RETENTION_DAYS = options['retention']
-        logging.warn("Override: Setting retention days to %d", RETENTION_DAYS)
-
-    if options.get('threads', None) is not None:
-        THREADS = options['threads']
-        logging.warn("Override: Setting threads to %d", THREADS)
-
-    if options.get('xf', None) is not None:
-        with open(options['xf'], 'r') as x:
-            for l in x.readlines():
-                EXCLUDES.append(l.strip())
-
-    if options.get('exclude', None) is not None:
-        for x in options['exclude']:
-            EXCLUDES.append(x)
-
-    logging.info("Excluding: %s", EXCLUDES)
-
-
 if __name__ == "__main__":
     import optparse
 
@@ -550,11 +539,11 @@ if __name__ == "__main__":
     args.add_option('-o', '--container', nargs=1, type="str",
             help='Container name to backup to.', metavar="backupContainer")
     args.add_option('-c', '--config', nargs=1, type="str",
-            default=_DEFAULT_CONFIG,
+            default=Application._DEFAULT_CONFIG,
             help='Configuration file containing login credintials.'
             ' Optional, but a configuration file must exist at %s' %
-                    _DEFAULT_CONFIG,
-                    metavar=_DEFAULT_CONFIG)
+                    Application._DEFAULT_CONFIG,
+                    metavar=Application._DEFAULT_CONFIG)
     args.add_option('--example', action="store_true", default=False,
             help="Print an example config and exit.")
 
@@ -568,28 +557,32 @@ if __name__ == "__main__":
             help='Days of retention to keep updated and deleted files.'
             ' This will create a backupContainer-revisions container.'
             ' Set to 0 to delete and overwrite files immediately.'
-            ' (default: %s)' % _DEFAULT_RETENTION, metavar=_DEFAULT_RETENTION)
+            ' (default: %s)' % Application._DEFAULT_RETENTION,
+            metavar=Application._DEFAULT_RETENTION)
 
     oargs.add_option('-t', '--threads', nargs=1, type="int",
             help='Number of threads to spawn.'
             'The number spawned will be two times this number.'
             'If in doubt, the default of %d will be used, resulting'
-            'in %d threads on this system.' % (_DEFAULT_THREADS,
-                _DEFAULT_THREADS * 2), metavar=_DEFAULT_THREADS)
+            'in %d threads on this system.' % (
+                Application._DEFAULT_THREADS,
+                Application._DEFAULT_THREADS * 2),
+                metavar=Application._DEFAULT_THREADS)
 
     oargs.add_option('-z', '--checksum', action='store_true',
             help='Use md5 checksums instead of time/size comparison. '
-            '(default: %s)' % _DEFAULT_CHECKHASH)
+            '(default: %s)' % Application._DEFAULT_CHECKHASH)
 
     oargs.add_option('-d', '--datacenter', nargs=1, type='str',
             help="Datacenter of the container. "
             "A contiainer will be created if it doesn't exist. "
-            "(default: %s)" % _DEFAULT_DC, metavar=_DEFAULT_DC)
+            "(default: %s)" % Application._DEFAULT_DC,
+            metavar=Application._DEFAULT_DC)
 
     oargs.add_option('-i', '--internal', action='store_true',
             help="Use SoftLayer's backend swift endpoint. "
             "Saves bandwidth if using it within the softlayer network. "
-            "(default: %s)" % _DEFAULT_USE_PRIVATE)
+            "(default: %s)" % Application._DEFAULT_USE_PRIVATE)
 
     xargs = optparse.OptionGroup(args, "Exclusion options",
         "Exclude particular directories.  DO NOT include the trailin slash!"
@@ -606,14 +599,14 @@ if __name__ == "__main__":
     args.add_option_group(xargs)
     (opts, extra) = args.parse_args()
 
-    configure_globals(opts)
+    app = Application(opts)
 
     if not hasattr(opts, 'source') or not opts.source:
         args.error("Missing parameter: --source")
 
-    if not hasattr(opts, 'container') or not opts.source:
+    if not hasattr(opts, 'container') or not opts.container:
         args.error("Missing parameter: --container")
 
     logging.config.fileConfig(opts.config)
-    os.chdir(opts.source)
-    upload_directory(opts.container, opts.source)
+    os.chdir(app.source)
+    upload_directory(app)
