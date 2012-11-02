@@ -1,16 +1,25 @@
 softlayer-object-storage-backup
 ===============================
 
-SoftLayer's object storage backup script.  Works like rsync, but with our object storage service!
+SoftLayer's object storage backup script.
 
 This script is indended to be used purely as a backup operation!
 It will not make you run faster or jump higher.  It might save you from a really
 bad day though.
 
+
+How it works
+-------------
+
+By default, the script uses time and size comparison based on the files mtime and upload time. The
+entire file is transfered if either the size or the time differs.  If retention is enabled, the original file
+is copied into a seperate container with the md5 sum inserted into the name before the changed file is uploaded.
+
+
 Features
 --------
 
-* Rsync-like delta backups - only changed/new files are uploaded saving you time/bandwidth.
+* Whole file delta backups - only changed/new files are uploaded saving you time/bandwidth.
 * Retention policies - deleted/updated files are kept for any desired length of time.  These can also be disabled.
 * Threaded - Copying can always be the longest part, so backups are done in the background as 
 file comparisions are being performed.
@@ -28,7 +37,8 @@ Usage
 5. run ```nano ~/.slbackup``` and put your credentials in there
 6. run with the desired options.
 
-I also [blogged about it](http://sldn.softlayer.com/blog/klandreth/Deglazing-slbackuppy-Usage-Object-Storage-Kitchen)
+I also [blogged about it] (http://sldn.softlayer.com/blog/klandreth/Deglazing-slbackuppy-Usage-Object-Storage-Kitchen)
+with a bit more verbosity.
 
 Known issues/limitations
 ========================
@@ -41,5 +51,5 @@ using Manifest files, but this script does not currently deal with this properly
 object fragments during file comparision.  Uploading and making the manifests is easy.
 * Windows Support:  Tried to write the script in a way that supported windows.  However, it is not tested yet.
 * Restoration: Restoring files is an operation left to the admin right now. 
-[FUSE is handy](https://github.com/redbo/cloudfuse) for that kine of work.
+[FUSE is handy](https://github.com/redbo/cloudfuse) for that kind of work.
 
