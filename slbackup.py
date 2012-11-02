@@ -160,6 +160,18 @@ class Application(object):
 
         logging.info("Excluding: %s", self.excludes)
 
+        if options.get('test'):
+            try:
+                self.authenticate()
+            except Exception, e:
+                print "Something is wrong: %s" % e
+            else:
+                print "Appears to work!"
+                print "URL:", self.url
+                print "Token:", self.token
+
+            sys.exit(0)
+
     def authenticate(self):
         use_network = 'private' if self.use_private else 'public'
 
@@ -634,6 +646,9 @@ if __name__ == "__main__":
                     metavar=Application._DEFAULT_CONFIG)
     args.add_option('--example', action="store_true", default=False,
             help="Print an example config and exit.")
+
+    args.add_option('--test', action="store_true", default=False,
+            help="Test authentication settings.")
 
     # config file overrides, optional
     oargs = optparse.OptionGroup(args, "Configuration parameters",
