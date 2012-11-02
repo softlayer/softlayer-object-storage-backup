@@ -529,8 +529,8 @@ def upload_files(app, jobs):
             l.warn("Uploading file %s", obj.name)
             chunk_upload(obj, _file)
             l.warn("Finished file %s ", obj.name)
-        except Exception:
-            l.error("Failed to upload %s, requeueing", _file)
+        except Exception, e:
+            l.error("Failed to upload %s, requeueing. Error: %s", _file, e)
             jobs.put((_file, target,))
             # in case we got disconnected, reset the container
             app.authenticate()
