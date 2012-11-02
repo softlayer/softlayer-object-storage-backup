@@ -117,8 +117,14 @@ class Application(object):
         self.excludes = []
         self.source = options.get('source')
         self.container = options.get('container')
+
+        self.auth_url = None
         self.token = None
         self.url = None
+
+        if c.has_option('slbackup', 'auth_url'):
+            self.auth_url = c.get('slbackup', 'auth_url')
+            logging.warn("Overriding auth url to %s", self.auth_url)
 
         # CLI overrides config file
         if options.get('datacenter', None) is not None:
@@ -162,7 +168,8 @@ class Application(object):
             self.username,
             self.apikey,
             datacenter=self.dc,
-            network=use_network)
+            network=use_network,
+            auth_url=self.auth_url)
 
         logging.info("Logging in as %s in %s",
                 self.username, self.dc)
@@ -181,7 +188,8 @@ def get_container(app, name=None):
     client = object_storage.get_client(
             app.username,
             app.apikey,
-            auth_token=app.token)
+            auth_token=app.token,
+            auth_url=app.auth_url)
     client.set_storage_url(app.url)
 
     return client[name]
@@ -424,12 +432,17 @@ def process_files(app, objects, files, backlog):
             backlog.put((_file, safe_filename,))
             continue
 
-        oldhash = objects[safe_filename].get('hash', None)
+        try:
+            oldhash = objects[safe_filename].get('hash', None)
 
-        oldsize = int(objects[safe_filename].get('size'))
-        cursize = int(get_filesize(_file))
-        curdate = int(os.path.getmtime(_file))
-        oldtime = objects[safe_filename].get('last_modified')
+            oldsize = int(objects[safe_filename].get('size'))
+            cursize = int(get_filesize(_file))
+            curdate = int(os.path.getmtime(_file))
+            oldtime = objects[safe_filename].get('last_modified')
+        except (OSError, IOError), e:
+            l.error("Couldn't read file size skipping, %s: %s", _file, e)
+            del objects[safe_filename]
+            continue
 
         # there are a few formats, try to figure out which one safely
         for timeformat in ['%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S']:
@@ -437,6 +450,8 @@ def process_files(app, objects, files, backlog):
                 oldtime = time.mktime(time.strptime(oldtime,
                     '%Y-%m-%dT%H:%M:%S.%f'))
             except ValueError:
+                l.warn("Failed to figure out the time format, skipping %s",
+                        _file)
                 continue
             else:
                 break
@@ -447,7 +462,12 @@ def process_files(app, objects, files, backlog):
             continue
         elif app.checkhash:
             l.info("Checksumming %s", _file)
-            newhash = swifthash(_file)
+            try:
+                newhash = swifthash(_file)
+            except (OSError, IOError), e:
+                l.error("Couldn't hash skipping, %s: %s", _file, e)
+                del objects[safe_filename]
+                continue
 
             if oldhash == newhash:
                 l.debug("No change in checksum: %s", _file)
@@ -525,10 +545,12 @@ def upload_files(app, jobs):
 
         try:
             obj = container.storage_object(target)
-            obj.create()
             l.warn("Uploading file %s", obj.name)
             chunk_upload(obj, _file)
             l.warn("Finished file %s ", obj.name)
+        except (OSError, IOError), e:
+            # For some reason we couldn't read the file, skip it but log it
+            l.error("Failed to upload %s. %s", _file, e)
         except Exception, e:
             l.error("Failed to upload %s, requeueing. Error: %s", _file, e)
             jobs.put((_file, target,))
@@ -568,8 +590,7 @@ def swifthash(_f):
 
 def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
     """Generator that yields buflen bytes from an open filehandle.
-    Yielded bytes might be less buflen.  Does not raise excepts for
-    IOError"""
+    Yielded bytes might be less buflen. """
     if not isinstance(_f, file):
         raise TypeError("First parameter must be an file object")
 
@@ -582,6 +603,7 @@ def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
                 break
     except IOError, e:
         logging.error("Failed to read %d bytes: %s", buflen, e)
+        raise e
 
 
 if __name__ == "__main__":
