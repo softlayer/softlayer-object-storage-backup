@@ -21,7 +21,6 @@ import ConfigParser
 from copy import copy
 from hashlib import md5
 from multiprocessing import Manager, Pool, cpu_count
-from itertools import repeat
 import Queue
 
 try:
@@ -320,83 +319,58 @@ def threaded_harvestor(app, files, directories, remote_objects):
             raise e
 
 
-def serial_processor(app, files, directories, remote_objects, uploads, deletes):
+def serial_processor(app, files, directories, remote_objects, uploads,
+        deletes):
     l = logging.getLogger('serial_processor')
 
     l.info("Processing directories (%d)", directories.qsize())
-    for job in queue_iter(directories):
-        create_directory(job, app, remote_objects)
+    process_directories = IterUnwrap(create_directory,
+            copy(app), remote_objects)
+    map(process_directories, queue_iter(directories))
 
-    for job in queue_iter(files):
-        process_file(job, app, remote_objects, uploads)
+    process_files = IterUnwrap(process_file,
+            copy(app), remote_objects, uploads)
+    map(process_files, queue_iter(files))
     uploads.put(None)
 
-    for item in queue_iter(uploads):
-        upload_file(item, app, uploads)
+    l.info("Starting uploader")
+    process_uploads = IterUnwrap(upload_file, copy(app), uploads)
+    map(process_uploads, queue_iter(uploads))
 
     l.info("%d objects scheduled for deletion", len(remote_objects))
     for d in remote_objects.values():
         deletes.put(d)
     deletes.put(None)
 
-    for item in queue_iter(deletes):
-        delete_file(item, app)
+    delete_files = IterUnwrap(delete_file, copy(app))
+    map(delete_files, queue_iter(deletes))
 
 
-def threaded_processor(app, files, directories, remote_objects, uploads, deletes):
+def threaded_processor(app, files, directories, remote_objects, uploads,
+        deletes):
     l = logging.getLogger("threaded_processor")
     workers = Pool(app.threads)
-
-    # For each scanner, create an backlog manager as we don't want the http
-    # backlog to grow too long and uploading/deleting will take 2-4x as long
 
     l.info("Creating directories")
     process_directories = IterUnwrap(create_directory,
             copy(app), remote_objects)
-    r = workers.map_async(process_directories, queue_iter(directories),
+    mkdir = workers.map_async(process_directories, queue_iter(directories),
             directories.qsize())
 
     l.info("Processing files")
     process_files = IterUnwrap(process_file,
             copy(app), remote_objects, uploads)
-    r = workers.map_async(process_files, queue_iter(files), files.qsize(),
+    touch = workers.map_async(process_files, queue_iter(files), files.qsize(),
             lambda x: uploads.put(None))
 
     l.info("Starting uploader")
     process_uploads = IterUnwrap(upload_file, copy(app), uploads)
-    r = workers.map_async(process_uploads, queue_iter(uploads), 1)
+    uploader = workers.map_async(process_uploads, queue_iter(uploads), 1)
 
-    workers.close()
-    workers.join()
-
-#    for p in xrange(app.threads):
-#        pool.append(Process(target=process_files,
-#           args=(copy(app), remote_objects, files, uploads)))
-#        if (p % 2) == 0:
-#            workers.append(Process(target=upload_files,
-#               args=(copy(app), uploads)))
-#        else:
-#            workers.append(Process(target=delete_files,
-#               args=(copy(app), deletes,)))
-#    workers.map_async(unwrap, zip((process_file, copy(app), remote_objects, uploads))) 
-#
-#    logging.info("Processing %d files (%d reads/%d writers)",
-#            files.qsize(), len(pool), len(workers))
-#
-#    for s in (pool + workers):
-#        s.start()
-#
     logging.info("Waiting for files to empty")
     # wait for the queue to empty
-    while not files.empty():
+    while not touch.ready() and not mkdir.ready():
         time.sleep(0.2)
-
-    logging.info("Queue empty, joining readers")
-    # join the readers after the queue in empty
-    # as to not prematurely delete any files
-    # that have pending operations
-    #for s in pool:
-    #    s.join()
 
     # After the readers have all exited, we know that remote_objects
     # contains the remaining files that should be deleted from
@@ -404,18 +378,17 @@ def threaded_processor(app, files, directories, remote_objects, uploads, deletes
     # care of.
     logging.info("%d objects scheduled for deletion", len(remote_objects))
     for d in remote_objects.values():
-        deletes.put((app.container, d))
+        deletes.put(d)
+    deletes.put(None)
+    delete_files = IterUnwrap(delete_file, copy(app))
+    workers.map_async(delete_files, queue_iter(deletes))
 
-    logging.info("Stopping uploaders")
-    # tell the uploaders they are done
-    for x in xrange(len(workers) / 2):
-        uploads.put(None)
-        deletes.put(None)
+    if not uploader.ready():
+        l.info("Still uploading")
 
-    # join the last of the threads
-    logging.info("Joining writers")
-    for s in workers:
-        s.join()
+    l.info("Cleaning up, joining workers")
+    workers.close()
+    workers.join()
 
 
 def encode_filename(string):
@@ -550,7 +523,7 @@ def new_revision(app, _from, marker):
         rev.create()
 
         obj.copy_to(rev)
-        delete_later(app, rev)
+        delete_later(rev, app)
 
 
 def delete_later(obj, app):
