@@ -20,7 +20,7 @@ import logging.config
 import ConfigParser
 from copy import copy
 from hashlib import md5
-from multiprocessing import Manager, Pool, cpu_count
+from multiprocessing import Manager, Pool, cpu_count, TimeoutError
 import Queue
 
 try:
@@ -362,14 +362,16 @@ def threaded_processor(app, files, directories, remote_objects, uploads,
         deletes, mkdirs):
     l = logging.getLogger("threaded_processor")
     workers = Pool(app.threads)
+    file_proc = None
+    dir_proc = None
 
     if directories.qsize() > 1:
         l.info("Processing %d directories", directories.qsize())
         dir_done = IterUnwrap(threaded_done_marker, mkdirs)
         process_directories = IterUnwrap(process_directory,
                 copy(app), remote_objects, mkdirs)
-        workers.map_async(process_directories, queue_iter(directories),
-                1, dir_done)
+        dir_proc = workers.map_async(process_directories,
+                queue_iter(directories), 1, dir_done)
 
         l.info("Creating Directories")
         mkdir = IterUnwrap(create_directory, copy(app))
@@ -382,7 +384,8 @@ def threaded_processor(app, files, directories, remote_objects, uploads,
         file_done = IterUnwrap(threaded_done_marker, uploads)
         process_files = IterUnwrap(process_file,
                 copy(app), remote_objects, uploads)
-        workers.map_async(process_files, queue_iter(files), None, file_done)
+        file_proc = workers.map_async(process_files,
+                queue_iter(files), None, file_done)
 
         l.info("Starting uploader")
         process_uploads = IterUnwrap(upload_file, copy(app), uploads)
@@ -391,7 +394,30 @@ def threaded_processor(app, files, directories, remote_objects, uploads,
         directories.get_nowait()
 
     l.info("Waiting to process files")
+
     #TODO wait for processing to finish
+    while file_proc and dir_proc:
+        if file_proc:
+            try:
+                file_res = file_proc.get(1)
+            except TimeoutError:
+                pass
+            else:
+                file_proc = None
+                if isinstance(file_res, Exception):
+                    raise
+
+        if dir_proc:
+            try:
+                dir_res = dir_proc.get(1)
+            except TimeoutError:
+                pass
+            else:
+                dir_proc = None
+                if isinstance(dir_res, Exception):
+                    raise
+
+        l.info("Waiting for processing")
 
     # After the readers have all exited, we know that remote_objects
     # contains the remaining files that should be deleted from
