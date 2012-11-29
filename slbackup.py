@@ -21,6 +21,7 @@ import ConfigParser
 from copy import copy
 from hashlib import md5
 from multiprocessing import Manager, Pool, cpu_count, TimeoutError
+from itertools import repeat
 import Queue
 
 try:
@@ -707,6 +708,22 @@ def queue_iter(queue):
             break
 
         yield item
+
+
+def roundrobin_iter(**queues):
+    total_queues = len(queues)
+    miss = 0
+    for name, q in repeat(queues.iteritems()):
+        try:
+            item = q.get(False)
+        except (Queue.Empty, TimeoutError):
+            miss += 1
+            if miss > total_queues:
+                break
+            continue
+        else:
+            miss = 0
+            yield name, item
 
 
 class IterUnwrap(object):
