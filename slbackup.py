@@ -194,6 +194,93 @@ class Application(object):
         del client
 
 
+def chunk_upload(obj, filename, headers=None):
+    upload = obj.chunk_upload(headers=headers)
+    with open(filename, 'rb') as _f:
+        for line in asblocks(_f):
+            upload.send(line)
+        upload.finish()
+
+
+def get_filesize(_f):
+    if isinstance(_f, file):
+        size = int(os.fstat(_f.fileno())[6])
+    else:
+        with open(_f) as data:
+            size = int(os.fstat(data.fileno())[6])
+
+    return size
+
+
+def swifthash(_f):
+    """ Compute md5 of the file for comparison """
+
+    m = md5()
+    with open(_f, 'rb') as data:
+        for line in asblocks(data):
+            m.update(line)
+
+    return m.hexdigest()
+
+
+def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
+    """Generator that yields buflen bytes from an open filehandle.
+    Yielded bytes might be less buflen. """
+    if not isinstance(_f, file):
+        raise TypeError("First parameter must be an file object")
+
+    try:
+        while True:
+            data = _f.read(buflen)
+            if data:
+                yield data
+            else:
+                break
+    except IOError, e:
+        logging.error("Failed to read %d bytes: %s", buflen, e)
+        raise e
+
+
+def queue_iter(queue):
+    while True:
+        try:
+            item = queue.get()
+        except Queue.Empty:
+            break
+
+        if item is None:
+            break
+
+        yield item
+
+
+def roundrobin_iter(**queues):
+    total_queues = len(queues)
+    miss = 0
+    for name, q in repeat(queues.iteritems()):
+        try:
+            item = q.get(False)
+        except (Queue.Empty, TimeoutError):
+            miss += 1
+            if miss > total_queues:
+                break
+            continue
+        else:
+            miss = 0
+            yield name, item
+
+
+class IterUnwrap(object):
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def __call__(self, item):
+        a = (item,) + self.args
+        return self.func(*a, **self.kwargs)
+
+
 def get_container(app, name=None):
     if name is None:
         name = app.container
@@ -648,93 +735,6 @@ def upload_file(job, app, jobs):
         # in case we got disconnected, reset the container
         app.authenticate()
         container = get_container(app)
-
-
-def chunk_upload(obj, filename, headers=None):
-    upload = obj.chunk_upload(headers=headers)
-    with open(filename, 'rb') as _f:
-        for line in asblocks(_f):
-            upload.send(line)
-        upload.finish()
-
-
-def get_filesize(_f):
-    if isinstance(_f, file):
-        size = int(os.fstat(_f.fileno())[6])
-    else:
-        with open(_f) as data:
-            size = int(os.fstat(data.fileno())[6])
-
-    return size
-
-
-def swifthash(_f):
-    """ Compute md5 of the file for comparison """
-
-    m = md5()
-    with open(_f, 'rb') as data:
-        for line in asblocks(data):
-            m.update(line)
-
-    return m.hexdigest()
-
-
-def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
-    """Generator that yields buflen bytes from an open filehandle.
-    Yielded bytes might be less buflen. """
-    if not isinstance(_f, file):
-        raise TypeError("First parameter must be an file object")
-
-    try:
-        while True:
-            data = _f.read(buflen)
-            if data:
-                yield data
-            else:
-                break
-    except IOError, e:
-        logging.error("Failed to read %d bytes: %s", buflen, e)
-        raise e
-
-
-def queue_iter(queue):
-    while True:
-        try:
-            item = queue.get()
-        except Queue.Empty:
-            break
-
-        if item is None:
-            break
-
-        yield item
-
-
-def roundrobin_iter(**queues):
-    total_queues = len(queues)
-    miss = 0
-    for name, q in repeat(queues.iteritems()):
-        try:
-            item = q.get(False)
-        except (Queue.Empty, TimeoutError):
-            miss += 1
-            if miss > total_queues:
-                break
-            continue
-        else:
-            miss = 0
-            yield name, item
-
-
-class IterUnwrap(object):
-    def __init__(self, func, *args, **kwargs):
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-
-    def __call__(self, item):
-        a = (item,) + self.args
-        return self.func(*a, **self.kwargs)
 
 
 if __name__ == "__main__":
