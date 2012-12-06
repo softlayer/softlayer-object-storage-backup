@@ -21,8 +21,7 @@ import ConfigParser
 from copy import copy
 from hashlib import md5
 from multiprocessing import Manager, Pool, cpu_count, TimeoutError
-from itertools import repeat
-import Queue
+from multiprocessing import Queue, JoinableQueue
 
 try:
     import object_storage
@@ -39,6 +38,16 @@ except ImportError:
     _DEFAULT_OS_BUFLEN = 4 * 1024
 else:
     _DEFAULT_OS_BUFLEN = resource.getpagesize()
+
+DATE_FORMATS = [
+    "%a, %d %b %Y %H:%M:%S %Z",
+    "%a, %d %b %Y %H:%M:%S.%f %Z",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d"
+    ]
 
 
 class Application(object):
@@ -194,14 +203,6 @@ class Application(object):
         del client
 
 
-def chunk_upload(obj, filename, headers=None):
-    upload = obj.chunk_upload(headers=headers)
-    with open(filename, 'rb') as _f:
-        for line in asblocks(_f):
-            upload.send(line)
-        upload.finish()
-
-
 def get_filesize(_f):
     if isinstance(_f, file):
         size = int(os.fstat(_f.fileno())[6])
@@ -257,17 +258,24 @@ def queue_iter(queue):
 def roundrobin_iter(**queues):
     total_queues = len(queues)
     miss = 0
-    for name, q in repeat(queues.iteritems()):
+    for name, q in queues.iteritems():
         try:
-            item = q.get(False)
+            item = q.get(False, 0.1)
         except (Queue.Empty, TimeoutError):
             miss += 1
             if miss > total_queues:
+                logging.info("dequeue failed")
                 break
+            continue
+        except IOError:
             continue
         else:
             miss = 0
-            yield name, item
+            if item:
+                yield name, item
+            else:
+                logging.info("Done processing %s", name)
+                q.close()
 
 
 class IterUnwrap(object):
@@ -279,6 +287,39 @@ class IterUnwrap(object):
     def __call__(self, item):
         a = (item,) + self.args
         return self.func(*a, **self.kwargs)
+
+
+def try_datetime_parse(datetime_str):
+    """
+    Tries to parse the datetime and return the UNIX epoc version of the time.
+
+    returns timestamp(int) or None
+    """
+    mtime = None
+    if datetime_str:
+        for fmt in DATE_FORMATS:
+            try:
+                mtime_tuple = time.strptime(datetime_str, fmt)
+                mtime = time.mktime(tuple(mtime_tuple))
+            except ValueError:
+                pass
+            else:
+                break
+    return mtime
+
+
+def encode_filename(string):
+    string = str(string)
+    uc = unicode(string, 'utf-8', 'replace')
+    return uc.encode('ascii', 'replace')
+
+
+def chunk_upload(obj, filename, headers=None):
+    upload = obj.chunk_upload(headers=headers)
+    with open(filename, 'rb') as _f:
+        for line in asblocks(_f):
+            upload.send(line)
+        upload.finish()
 
 
 def get_container(app, name=None):
@@ -317,8 +358,6 @@ def catalog_directory(app, directory, files, directories):
             files.put(os.path.relpath(os.path.join(root, _file)))
 
     logging.info("Done gathering local files")
-    files.put(None)
-    directories.put(None)
 
 
 def catalog_remote(app, objects):
@@ -345,8 +384,8 @@ def catalog_remote(app, objects):
 def upload_directory(app):
     """ Uploads an entire local directory. """
     manager = Manager()
-    directories = manager.Queue()
-    files = manager.Queue()
+    directories = JoinableQueue()
+    files = JoinableQueue()
     remote_objects = manager.dict()
     uploads = manager.Queue()
     deletes = manager.Queue()
@@ -374,6 +413,10 @@ def upload_directory(app):
 def serial_harvestor(app, files, directories, remote_objects):
     catalog_directory(copy(app), app.source, files, directories)
     catalog_remote(copy(app), remote_objects)
+    # since serial processor doesn't use any threads and uses queue_iter()
+    # we have to mark the end of the queue so queue_iter exits
+    files.put(None)
+    directories.put(None)
 
 
 def threaded_harvestor(app, files, directories, remote_objects):
@@ -408,10 +451,18 @@ def threaded_harvestor(app, files, directories, remote_objects):
             raise e
 
 
+def serial_queue_item(func, queue, *args):
+    rt = func(*args)
+    if hasattr(queue, 'task_done'):
+        queue.task_done()
+    return rt
+
+
 def serial_processor(app, files, directories, remote_objects, uploads,
         deletes, mkdirs):
     l = logging.getLogger('serial_processor')
 
+    # TODO fix to use serial_queue_item
     l.info("Processing directories (%d)", directories.qsize())
     process_directories = IterUnwrap(process_directory,
             copy(app), remote_objects, mkdirs)
@@ -443,101 +494,141 @@ def serial_processor(app, files, directories, remote_objects, uploads,
 def threaded_done_marker(results, queue):
     if isinstance(results, Exception):
         logging.exception(results)
-    queue.put(None)
 
+    if hasattr(queue, 'task_done'):
+        queue.task_done()
+    else:
+        queue.put(None)
+
+
+def process_deletes(app, files, directories, deletes)):
+    files.join()
+    directories.join()
+    for d in remote_objects.values():
+        deletes.put(d)
+    deletes.join()
 
 def threaded_processor(app, files, directories, remote_objects, uploads,
         deletes, mkdirs):
     l = logging.getLogger("threaded_processor")
     workers = Pool(app.threads)
-    writers = Pool(app.threads)
-    file_proc = None
-    dir_proc = None
-    upload_proc = None
+    jobs = JoinableQueue()
+    backlog = JoinableQueue(app.threads)
 
-    if directories.qsize() > 1:
+    # total work feeds into backlog as items are available
+    # and as the queue is still open
+    # start thread to for pushing directories and file
+    # start thread for uploads and mkdirs and deletes
+    # join pusher
+    # populate deleter
+    # join writers
 
-        l.info("Processing %d directories", directories.qsize())
-        dir_done = IterUnwrap(threaded_done_marker, mkdirs)
-        process_directories = IterUnwrap(process_directory,
-                copy(app), remote_objects, mkdirs)
-        dir_proc = workers.map_async(process_directories,
-                queue_iter(directories), app.threads, dir_done)
+    processors = {
+        'directory': {
+            'func': IterUnwrap(process_directory, copy(app), remote_objects,
+                mkdirs),
+            'source': directories,
+        },
+        'file': {
+            'func': IterUnwrap(process_file, copy(app), remote_objects,
+                uploads),
+            'source': files,
+        },
+        'mkdir': {
+            'func': IterUnwrap(create_directory, copy(app)),
+            'source': mkdirs,
+        },
+        'upload': {
+            'func': IterUnwrap(upload_file, copy(app), uploads),
+            'source': uploads,
+        },
+    }
 
-        l.info("Creating Directories")
-        mkdir = IterUnwrap(create_directory, copy(app))
-        writers.map_async(mkdir, queue_iter(mkdirs), app.threads)
-    else:
-        directories.get_nowait()
+    workers.apply_async(process_deletes, (app, files, directories, deletes,))
+    files.join()
+    directories.join()
 
-    if files.qsize() > 1:
-        l.info("Processing files")
-        file_done = IterUnwrap(threaded_done_marker, uploads)
-        process_files = IterUnwrap(process_file,
-                copy(app), remote_objects, uploads)
-        file_proc = workers.map_async(process_files,
-                queue_iter(files), 2, file_done)
-
-    else:
-        directories.get_nowait()
-
-    l.info("Waiting to process files")
-
-    #TODO wait for processing to finish
-    while file_proc or dir_proc or upload_proc:
-        l.info("Waiting for processing")
-        if file_proc:
-            try:
-                file_res = file_proc.wait(1)
-                file_proc.successful()
-            except (TimeoutError, AssertionError):
-                l.info("Still processing files")
-            else:
-                l.info("Done processing files")
-                file_proc = None
-                if isinstance(file_res, Exception):
-                    raise
-
-        if dir_proc:
-            try:
-                dir_res = dir_proc.wait(1)
-            except TimeoutError:
-                l.info("Still processing directories")
-            else:
-                l.info("Done processing directories")
-                dir_proc = None
-                if isinstance(dir_res, Exception):
-                    raise
-
-        if upload_proc:
-            try:
-                upload_proc.wait(1)
-                upload_proc.successful()
-            except (TimeoutError, AssertionError):
-                l.info("Still processing uploads")
-            else:
-                l.info("Done processing uploads")
-                upload_proc = None
-        elif uploads.qsize() > 0:
-            process_uploads = IterUnwrap(upload_file, copy(app), uploads)
-            l.info("Starting uploader")
-            upload_proc = writers.map_async(process_uploads,
-                    queue_iter(uploads), app.threads)
-            l.info("This didn't run right away")
-
-    # After the readers have all exited, we know that remote_objects
-    # contains the remaining files that should be deleted from
-    # the backups.  Dump these into a Queue for the writers to take
-    # care of.
-    for d in remote_objects.values():
-        deletes.put(d)
-    deletes.put(None)
     logging.info("%d objects scheduled for deletion", deletes.qsize() - 1)
     delete_files = IterUnwrap(delete_file, copy(app), deletes)
     workers.map_async(delete_files, queue_iter(deletes))
 
+    for name, item in roundrobin_iter(
+            **dict([(k, processors[k]['source']) for k in processors.keys()])):
+        workers.apply_async(processors[name]['func'], (item,))
+#
+#    if directories.qsize() > 1:
+#        l.info("Processing %d directories", directories.qsize())
+#        dir_done = IterUnwrap(threaded_done_marker, mkdirs)
+#        process_directories = None
+#        dir_proc = workers.map_async(process_directories,
+#                queue_iter(directories), app.threads, dir_done)
+#
+#        l.info("Creating Directories")
+#        mkdir = None
+#        workers.map_async(mkdir, queue_iter(mkdirs), app.threads)
+#    else:
+#        directories.get_nowait()
+#
+#    if files.qsize() > 1:
+#        l.info("Processing files")
+#        file_done = IterUnwrap(threaded_done_marker, uploads)
+#        process_files = None
+#        file_proc = workers.map_async(process_files,
+#                queue_iter(files), 2, file_done)
+#
+#    else:
+#        directories.get_nowait()
+#
+#    l.info("Waiting to process files")
+#
+#    #TODO wait for processing to finish
+#    while file_proc or dir_proc or upload_proc:
+#        l.info("Waiting for processing")
+#        if file_proc:
+#            try:
+#                file_res = file_proc.wait(1)
+#                file_proc.successful()
+#            except (TimeoutError, AssertionError):
+#                l.info("Still processing files")
+#            else:
+#                l.info("Done processing files")
+#                file_proc = None
+#                if isinstance(file_res, Exception):
+#                    raise
+#
+#        if dir_proc:
+#            try:
+#                dir_res = dir_proc.wait(1)
+#            except TimeoutError:
+#                l.info("Still processing directories")
+#            else:
+#                l.info("Done processing directories")
+#                dir_proc = None
+#                if isinstance(dir_res, Exception):
+#                    raise
+#
+#        if upload_proc:
+#            try:
+#                upload_proc.wait(1)
+#                upload_proc.successful()
+#            except (TimeoutError, AssertionError):
+#                l.info("Still processing uploads")
+#            else:
+#                l.info("Done processing uploads")
+#                upload_proc = None
+#        elif uploads.qsize() > 0:
+#            process_uploads =
+#            l.info("Starting uploader")
+#            upload_proc = workers.map_async(process_uploads,
+#                    queue_iter(uploads), app.threads)
+#            l.info("This didn't run right away")
+    l.info("Exiting")
+    sys.exit(0)
+    # After the readers have all exited, we know that remote_objects
+    # contains the remaining files that should be deleted from
+    # the backups.  Dump these into a Queue for the writers to take
+    # care of.
     workers.close()
-    writers.close()
 
     while (uploads.qsize() + mkdirs.qsize() + deletes.qsize()) > 0:
         l.info("Actions remaining:- uploading:%d mkdir:%d deletes:%d",
@@ -549,13 +640,6 @@ def threaded_processor(app, files, directories, remote_objects, uploads,
     l.info("Cleaning up, letting pending items finish %d",
             (uploads.qsize() + mkdirs.qsize() + deletes.qsize()))
     workers.join()
-    writers.join()
-
-
-def encode_filename(string):
-    string = str(string)
-    uc = unicode(string, 'utf-8', 'replace')
-    return uc.encode('ascii', 'replace')
 
 
 def process_directory(directory, app, remote_objects, mkdirs):
@@ -596,7 +680,7 @@ def delete_file(obj, app, jobs):
         rm = get_container(app).storage_object(obj['name'])
         rm.delete()
     except Exception, e:
-        l.error("Failed to upload %s, requeueing. Error: %s", obj['name'], e)
+        l.error("Failed to delete %s, requeueing. Error: %s", obj['name'], e)
         jobs.put(obj)
         # in case we got disconnected, reset the container
         app.authenticate()
@@ -611,59 +695,63 @@ def process_file(_file, app, objects, backlog):
     if safe_filename not in objects:
         l.debug("Queued missing %s", safe_filename)
         backlog.put((_file, safe_filename,))
-        return
+        return True
 
-    try:
-        oldhash = objects[safe_filename].get('hash', None)
-
+    def _do_timesize():
         oldsize = int(objects[safe_filename].get('size'))
         cursize = int(get_filesize(_file))
         curdate = int(os.path.getmtime(_file))
         oldtime = objects[safe_filename].get('last_modified')
-    except (OSError, IOError), e:
-        l.error("Couldn't read file size skipping, %s: %s", _file, e)
-        del objects[safe_filename]
-        return
 
-    # there are a few formats, try to figure out which one safely
-    for timeformat in ['%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S']:
-        try:
-            oldtime = time.mktime(time.strptime(oldtime,
-                '%Y-%m-%dT%H:%M:%S.%f'))
-        except ValueError:
-            l.warn("Failed to figure out the time format, skipping %s",
-                    _file)
-            return
-        else:
-            break
+        # there are a few formats, try to figure out which one safely
+        oldtime = try_datetime_parse(oldtime)
+        if oldtime is None:
+            l.warn("Failed to figure out the time format, skipping %s", _file)
+            return False
 
-    if cursize == oldsize and oldtime >= curdate and not app.checkhash:
-        l.debug("No change in filesize/date: %s", _file)
-        del objects[safe_filename]
-        return
-    elif app.checkhash:
-        l.debug("Checksumming %s", _file)
-        try:
-            newhash = swifthash(_file)
-        except (OSError, IOError), e:
-            l.error("Couldn't hash skipping, %s: %s", _file, e)
+        if cursize == oldsize and oldtime >= curdate:
+            l.debug("No change in filesize/date: %s", _file)
             del objects[safe_filename]
-            return
+            return False
+
+        l.debug("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
+                oldsize, cursize, oldtime, curdate, safe_filename)
+        return True
+
+    def _do_checksum():
+        l.debug("Checksumming %s", _file)
+
+        oldhash = objects[safe_filename]['hash']
+        newhash = swifthash(_file)
 
         if oldhash == newhash:
             l.debug("No change in checksum: %s", _file)
             del objects[safe_filename]
-            return
-        else:
-            l.debug("Revised: HASH:%s:%s FILE:%s",
-                    oldhash, newhash, safe_filename)
-    else:
-        l.debug("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
-                oldsize, cursize, oldtime, curdate, safe_filename)
+            return False
 
-    del objects[safe_filename]
-    new_revision(app, _file, oldhash)
-    backlog.put((_file, safe_filename,))
+        l.debug("Revised: HASH:%s:%s FILE:%s", oldhash, newhash, safe_filename)
+        return True
+
+    compare = _do_timesize
+    if app.checkhash:
+        compare = _do_checksum
+
+    try:
+        if compare():
+            # make a new copy, retention is handled there.  Start uploading
+            # and then remove it so it doesn't get deleted
+            new_revision(app, _file, objects[safe_filename]['hash'])
+            backlog.put((_file, safe_filename,))
+            del objects[safe_filename]
+
+    except (OSError, IOError), e:
+        l.error("Couldn't read file size skipping, %s: %s", _file, e)
+        # Just because we can't read it doesn't mean we dont' have
+        # the permission, it could be a medium error in which case
+        # don't delete the file, remote it from the remote object
+        # so it doesn't get marked for deletion
+        del objects[safe_filename]
+        return False
 
 
 def new_revision(app, _from, marker):
