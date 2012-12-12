@@ -12,7 +12,7 @@ setup(name='slbackup',
       license='MIT',
       include_package_data=True,
       zip_safe=False,
-      install_requires=['softlayer-object-storage>=0.4.4'],
+      install_requires=['softlayer-object-storage>=0.4.6'],
       scripts=['slbackup.py'],
       classifiers=[
         'Development Status :: 5 - Production/Stable',

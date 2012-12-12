@@ -18,16 +18,19 @@ import time
 import logging
 import logging.config
 import ConfigParser
+import signal
 from copy import copy
 from hashlib import md5
-from multiprocessing import Manager, Pool, cpu_count, TimeoutError
-from multiprocessing import Queue, JoinableQueue
+from multiprocessing import Pool, cpu_count, Process
+from multiprocessing import Manager
+from itertools import repeat
 
 try:
     import object_storage
 except ImportError:
     print "ERROR: You need the latest object storage bindings from github:"
     print "  https://github.com/softlayer/softlayer-object-storage-python"
+    print "  or pip install softlayer-object-storage"
     sys.exit(1)
 
 try:
@@ -35,19 +38,10 @@ try:
 except ImportError:
     # well, must be windows, assume an 4Kb slab
     # regardless if long mode is supported
-    _DEFAULT_OS_BUFLEN = 4 * 1024
-else:
-    _DEFAULT_OS_BUFLEN = resource.getpagesize()
-
-DATE_FORMATS = [
-    "%a, %d %b %Y %H:%M:%S %Z",
-    "%a, %d %b %Y %H:%M:%S.%f %Z",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%dT%H:%M:%S.%f",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d %H:%M:%S.%f",
-    "%Y-%m-%d"
-    ]
+    def default_page():
+        return 4 * 1024
+    resource = object()
+    resource.getpagesize = default_page
 
 
 class Application(object):
@@ -57,7 +51,17 @@ class Application(object):
     _DEFAULT_THREADS = cpu_count()
     _DEFAULT_DC = 'dal05'
     _DEFAULT_USE_PRIVATE = False
-    _DEFAULT_OS_BUFLEN = 1024
+    _DEFAULT_OS_BUFLEN = resource.getpagesize()
+
+    DATE_FORMATS = [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S.%f %Z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d"
+    ]
 
     def __init__(self, options):
         if not isinstance(options, dict):
@@ -183,24 +187,262 @@ class Application(object):
 
             sys.exit(0)
 
-    def authenticate(self):
+    def try_datetime_parse(self, datetime_str):
+        """
+        Tries to parse the datetime and return the UNIX epoc version of time
+
+        returns timestamp(int) or None
+        """
+        mtime = None
+        if datetime_str:
+            for fmt in self.DATE_FORMATS:
+                try:
+                    mtime_tuple = time.strptime(datetime_str, fmt)
+                    mtime = time.mktime(tuple(mtime_tuple))
+                except ValueError:
+                    pass
+                else:
+                    break
+        return mtime
+
+    def _setup_client(self):
         use_network = 'private' if self.use_private else 'public'
 
         object_storage.consts.USER_AGENT = __agent__
-        client = object_storage.get_client(
+        self.client = object_storage.get_client(
             self.username,
             self.apikey,
             datacenter=self.dc,
             network=use_network,
             auth_url=self.auth_url)
 
+    def authenticate(self):
+        self._setup_client()
+
         logging.info("Logging in as %s in %s",
                 self.username, self.dc)
-        client.conn.auth.authenticate()
 
-        self.url = client.get_url()
-        self.token = copy(client.conn.auth.auth_token)
-        del client
+        self.client.conn.auth.authenticate()
+
+        self.url = self.client.get_url()
+        self.token = copy(self.client.conn.auth.auth_token)
+
+        self.client.set_storage_url(self.url)
+
+    def get_container(self, name=None):
+        if name is None:
+            name = self.container
+
+        return self.client[name]
+
+    def new_revision(self, _from, marker):
+        l = logging.getLogger("new_revision")
+        if self.retention < 1:
+            l.warn("Retention disabled for %s", _from)
+            return None
+
+        # copy the file to the -revisions container so we don't
+        # pollute the deleted items list.  Not putting revisions
+        # in a seperate container will lead to an ever growing
+        # list slowing down the backups
+
+        _rev_container = "%s-revisions" % self.container
+
+        safe_filename = encode_filename(_from)
+        fs = os.path.splitext(safe_filename)
+        new_file = fs[0] + "_" + marker + fs[1]
+
+        container = self.get_container()
+        revcontainer = self.get_container(name=_rev_container)
+        revcontainer.create()
+
+        obj = container.storage_object(safe_filename)
+        rev = revcontainer.storage_object(new_file)
+
+        if obj.exists():
+            l.debug("Copying %s to %s", obj.name, rev.name)
+            rev.create()
+            obj.copy_to(rev)
+            self.delete_later(rev)
+
+    def delete_later(self, obj):
+        """ lacking this in the bindings currently, work around it.
+            Deletes a file after the specified number of days
+        """
+        l = logging.getLogger("delete_later")
+        delta = int(self.retention) * 24 * 60 * 60
+        when = int(time.time()) + delta
+        l.debug("Setting retention(%d) on %s", when, obj.name)
+
+        headers = {
+            'X-Delete-At': str(when),
+            'Content-Length': '0'}
+        obj.make_request('POST', headers=headers)
+
+    def create_directory(self, item):
+        l = logging.getLogger("create_directory")
+
+        safe_dir = encode_filename(item)
+        l.info("Creating %s", safe_dir)
+
+        container = app.get_container()
+        obj = container.storage_object(safe_dir)
+        obj.content_type = 'application/directory'
+        obj.create()
+
+        return True
+
+    def upload_file(self, _file, failed=False):
+        l = logging.getLogger('upload_file')
+        container = self.get_container()
+
+        target = encode_filename(_file)
+
+        try:
+            obj = container.storage_object(target)
+            l.info("Uploading file %s", obj.name)
+            chunk_upload(obj, _file)
+            l.debug("Finished file %s ", obj.name)
+        except (OSError, IOError), e:
+            # For some reason we couldn't read the file, skip it but log it
+            l.exception("Failed to upload %s. %s", _file, e)
+        except Exception, e:
+            if failed:
+                l.error("Couldn't upload %s, skiping: %s", _file, e)
+            else:
+                l.error("Failed to upload %s, requeueing. Error: %s", _file, e)
+                # in case we got disconnected, reset the container
+                self.authenticate()
+                return self.upload_file(_file, failed=True)
+        else:
+            return True
+
+        return False
+
+    def delete_file(self, obj, failed=False):
+        l = logging.getLogger("delete_file")
+        l.info("Deleting %s", obj['name'])
+
+        try:
+            # Copy the file out of the way
+            self.new_revision(obj['name'], obj.get('hash', 'deleted'))
+
+            # then delete it as it no longer exists.
+            rm = self.get_container().storage_object(obj['name'])
+            rm.delete()
+        except Exception, e:
+            if not failed:
+                l.exception("Failed to delete %s, requeueing. Error: %s",
+                        obj['name'], e)
+                # in case we got disconnected, reset the container
+                self.authenticate()
+                return self.delete_file(obj, failed=True)
+            else:
+                l.exception("Failed to upload %s. %s", obj['name'], e)
+        else:
+            return True
+        return False
+
+    def process_file(self, job):
+        """ returns if a file should be uploaded or not and
+        if the file should be be marked as done"""
+        l = logging.getLogger('process_file')
+
+        try:
+            _file, obj = job
+        except ValueError:
+            raise ValueError("Job not a tuple")
+
+        def _do_timesize():
+            oldsize = int(obj.get('size'))
+            cursize = int(get_filesize(_file))
+            curdate = int(os.path.getmtime(_file))
+            oldtime = obj.get('last_modified')
+
+            # there are a few formats, try to figure out which one safely
+            oldtime = self.try_datetime_parse(oldtime)
+            if oldtime is None:
+                l.warn("Failed to figure out the time format, skipping %s",
+                        _file)
+                return False
+
+            if cursize == oldsize and oldtime >= curdate:
+                l.debug("No change in filesize/date: %s", _file)
+                return False
+
+            l.debug("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
+                    oldsize, cursize, oldtime, curdate, _file)
+            return True
+
+        def _do_checksum():
+            l.debug("Checksumming %s", _file)
+
+            oldhash = obj['hash']
+            newhash = swifthash(_file)
+
+            if oldhash == newhash:
+                l.debug("No change in checksum: %s", _file)
+                return False
+
+            l.debug("Revised: HASH:%s:%s FILE:%s", oldhash, newhash, _file)
+            return True
+
+        compare = _do_timesize
+        if app.checkhash:
+            compare = _do_checksum
+
+        upload_file = False
+        try:
+            if compare():
+                # make a new copy, retention is handled there.  Start uploading
+                # and then remove it so it doesn't get deleted
+                self.new_revision(_file, obj['hash'])
+                upload_file = True
+        except (OSError, IOError), e:
+            l.error("Couldn't read file size skipping, %s: %s", _file, e)
+        # Just because we can't read it doesn't mean we don't have
+        # the permission, it could be a medium error in which case
+        # don't delete the file, remove it from the remote object dict
+        # so it doesn't get marked for deletion later on.  Even if
+        # the file doesn't need backing up, remove it just the same
+        return upload_file
+
+    def __call__(self, item):
+        work, job = item
+
+        self._setup_client()
+
+        if self.url:
+            self.client.set_storage_url(self.url)
+
+        if self.token:
+            self.client.conn.auth.auth_token = self.token
+
+        if not self.url or not self.token:
+            logging.warn("Invalid authentication")
+            self.authenticate()
+
+        if work == 'stat':
+            rt = self.process_file(job)
+            if rt:
+                rt = self.upload_file(job[0])
+        elif work == 'delete':
+            rt = self.delete_file(job)
+        elif work == 'mkdir':
+            rt = self.create_directory(job)
+        elif work == 'upload':
+            rt = self.upload_file(job)
+        else:
+            logging.fatal("Unknown work type: %s", work)
+
+        if isinstance(job, dict):
+            logging.debug("%s for %s returned %s", work, job['name'], rt)
+        else:
+            logging.debug("%s for %s returned %s", work, job, rt)
+
+
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def get_filesize(_f):
@@ -224,7 +466,7 @@ def swifthash(_f):
     return m.hexdigest()
 
 
-def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
+def asblocks(_f, buflen=resource.getpagesize()):
     """Generator that yields buflen bytes from an open filehandle.
     Yielded bytes might be less buflen. """
     if not isinstance(_f, file):
@@ -242,72 +484,6 @@ def asblocks(_f, buflen=_DEFAULT_OS_BUFLEN):
         raise e
 
 
-def queue_iter(queue):
-    while True:
-        try:
-            item = queue.get()
-        except Queue.Empty:
-            break
-
-        if item is None:
-            break
-
-        yield item
-
-
-def roundrobin_iter(**queues):
-    total_queues = len(queues)
-    miss = 0
-    for name, q in queues.iteritems():
-        try:
-            item = q.get(False, 0.1)
-        except (Queue.Empty, TimeoutError):
-            miss += 1
-            if miss > total_queues:
-                logging.info("dequeue failed")
-                break
-            continue
-        except IOError:
-            continue
-        else:
-            miss = 0
-            if item:
-                yield name, item
-            else:
-                logging.info("Done processing %s", name)
-                q.close()
-
-
-class IterUnwrap(object):
-    def __init__(self, func, *args, **kwargs):
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-
-    def __call__(self, item):
-        a = (item,) + self.args
-        return self.func(*a, **self.kwargs)
-
-
-def try_datetime_parse(datetime_str):
-    """
-    Tries to parse the datetime and return the UNIX epoc version of the time.
-
-    returns timestamp(int) or None
-    """
-    mtime = None
-    if datetime_str:
-        for fmt in DATE_FORMATS:
-            try:
-                mtime_tuple = time.strptime(datetime_str, fmt)
-                mtime = time.mktime(tuple(mtime_tuple))
-            except ValueError:
-                pass
-            else:
-                break
-    return mtime
-
-
 def encode_filename(string):
     string = str(string)
     uc = unicode(string, 'utf-8', 'replace')
@@ -322,22 +498,7 @@ def chunk_upload(obj, filename, headers=None):
         upload.finish()
 
 
-def get_container(app, name=None):
-    if name is None:
-        name = app.container
-
-    object_storage.consts.USER_AGENT = __agent__
-    client = object_storage.get_client(
-            app.username,
-            app.apikey,
-            auth_token=app.token,
-            auth_url=app.auth_url)
-    client.set_storage_url(app.url)
-
-    return client[name]
-
-
-def catalog_directory(app, directory, files, directories):
+def catalog_directory(app, files, directories):
     logging.info("Gathering local files")
     for root, dirnames, filenames in os.walk('.'):
         # Prune all excluded directories from the list
@@ -352,17 +513,17 @@ def catalog_directory(app, directory, files, directories):
                     dirnames.remove(p)
 
         for _dir in dirnames:
-            directories.put(os.path.relpath(os.path.join(root, _dir)))
+            directories.append(os.path.relpath(os.path.join(root, _dir)))
 
         for _file in filenames:
-            files.put(os.path.relpath(os.path.join(root, _file)))
+            files.append(os.path.relpath(os.path.join(root, _file)))
 
     logging.info("Done gathering local files")
 
 
 def catalog_remote(app, objects):
     logging.info("Grabbing remote objects")
-    container = get_container(app)
+    container = app.get_container()
     container.create()
     f = container.objects()
     while True:
@@ -381,265 +542,24 @@ def catalog_remote(app, objects):
     logging.info("Objects %d", len(objects))
 
 
-def upload_directory(app):
-    """ Uploads an entire local directory. """
-    manager = Manager()
-    directories = JoinableQueue()
-    files = JoinableQueue()
-    remote_objects = manager.dict()
-    uploads = manager.Queue()
-    deletes = manager.Queue()
-    mkdirs = manager.Queue()
+def delta_force_one(files, directories, remote_objects):
+    f = set(files)
+    d = set(directories)
+    r = set(remote_objects.keys())
+    a = set(files + directories)
+    # FIXME patchup file and directory names for comparison
 
-    app.authenticate()
+    work = zip(repeat('upload'), f - r) + \
+           zip(repeat('mkdir'), d - r)
 
-    logging.debug("%s %s", app.token, app.url)
+    # add the remote object directly to the delete queue
+    for dl in (r - a):
+        work.append(('delete', remote_objects[dl],))
 
-    if app.threads:
-        threaded_harvestor(app, files, directories, remote_objects)
-    else:
-        serial_harvestor(app, files, directories, remote_objects)
+    for st in (a & r):
+        work.append(('stat', (st, remote_objects[st],),))
 
-    args = (app, files, directories, remote_objects, uploads, deletes, mkdirs,)
-
-    if app.threads:
-        threaded_processor(*args)
-    else:
-        serial_processor(*args)
-
-    logging.info("Done backing up %s to %s", app.source, app.container)
-
-
-def serial_harvestor(app, files, directories, remote_objects):
-    catalog_directory(copy(app), app.source, files, directories)
-    catalog_remote(copy(app), remote_objects)
-    # since serial processor doesn't use any threads and uses queue_iter()
-    # we have to mark the end of the queue so queue_iter exits
-    files.put(None)
-    directories.put(None)
-
-
-def threaded_harvestor(app, files, directories, remote_objects):
-    pool = Pool(app.threads)
-
-    logging.info("Starting harvesters")
-
-    local = pool.apply_async(catalog_directory,
-            (copy(app), app.source, files, directories,))
-    remote = pool.apply_async(catalog_remote,
-        (copy(app), remote_objects,))
-
-    pool.close()
-
-    logging.info("Waiting for harvest")
-    pool.join()
-
-    if not local.successful():
-        logging.error("Local processing encountered an error")
-        try:
-            local.get()
-        except Exception, e:
-            logging.exception(e)
-            raise e
-
-    if not remote.successful():
-        logging.error("Remote processing encountered an error")
-        try:
-            remote.get()
-        except Exception, e:
-            logging.exception(e)
-            raise e
-
-
-def serial_queue_item(func, queue, *args):
-    rt = func(*args)
-    if hasattr(queue, 'task_done'):
-        queue.task_done()
-    return rt
-
-
-def serial_processor(app, files, directories, remote_objects, uploads,
-        deletes, mkdirs):
-    l = logging.getLogger('serial_processor')
-
-    # TODO fix to use serial_queue_item
-    l.info("Processing directories (%d)", directories.qsize())
-    process_directories = IterUnwrap(process_directory,
-            copy(app), remote_objects, mkdirs)
-    map(process_directories, queue_iter(directories))
-    mkdirs.put(None)
-
-    l.info("Creating Directories")
-    create_dir = IterUnwrap(create_directory, copy(app))
-    map(create_dir, queue_iter(mkdirs))
-
-    process_files = IterUnwrap(process_file,
-            copy(app), remote_objects, uploads)
-    map(process_files, queue_iter(files))
-    uploads.put(None)
-
-    l.info("Starting uploader")
-    process_uploads = IterUnwrap(upload_file, copy(app), uploads)
-    map(process_uploads, queue_iter(uploads))
-
-    l.info("%d objects scheduled for deletion", len(remote_objects))
-    for d in remote_objects.values():
-        deletes.put(d)
-    deletes.put(None)
-
-    delete_files = IterUnwrap(delete_file, copy(app), deletes)
-    map(delete_files, queue_iter(deletes))
-
-
-def threaded_done_marker(results, queue):
-    if isinstance(results, Exception):
-        logging.exception(results)
-
-    if hasattr(queue, 'task_done'):
-        queue.task_done()
-    else:
-        queue.put(None)
-
-
-def process_deletes(app, files, directories, deletes)):
-    files.join()
-    directories.join()
-    for d in remote_objects.values():
-        deletes.put(d)
-    deletes.join()
-
-def threaded_processor(app, files, directories, remote_objects, uploads,
-        deletes, mkdirs):
-    l = logging.getLogger("threaded_processor")
-    workers = Pool(app.threads)
-    jobs = JoinableQueue()
-    backlog = JoinableQueue(app.threads)
-
-    # total work feeds into backlog as items are available
-    # and as the queue is still open
-    # start thread to for pushing directories and file
-    # start thread for uploads and mkdirs and deletes
-    # join pusher
-    # populate deleter
-    # join writers
-
-    processors = {
-        'directory': {
-            'func': IterUnwrap(process_directory, copy(app), remote_objects,
-                mkdirs),
-            'source': directories,
-        },
-        'file': {
-            'func': IterUnwrap(process_file, copy(app), remote_objects,
-                uploads),
-            'source': files,
-        },
-        'mkdir': {
-            'func': IterUnwrap(create_directory, copy(app)),
-            'source': mkdirs,
-        },
-        'upload': {
-            'func': IterUnwrap(upload_file, copy(app), uploads),
-            'source': uploads,
-        },
-    }
-
-    workers.apply_async(process_deletes, (app, files, directories, deletes,))
-    files.join()
-    directories.join()
-
-    logging.info("%d objects scheduled for deletion", deletes.qsize() - 1)
-    delete_files = IterUnwrap(delete_file, copy(app), deletes)
-    workers.map_async(delete_files, queue_iter(deletes))
-
-    for name, item in roundrobin_iter(
-            **dict([(k, processors[k]['source']) for k in processors.keys()])):
-        workers.apply_async(processors[name]['func'], (item,))
-#
-#    if directories.qsize() > 1:
-#        l.info("Processing %d directories", directories.qsize())
-#        dir_done = IterUnwrap(threaded_done_marker, mkdirs)
-#        process_directories = None
-#        dir_proc = workers.map_async(process_directories,
-#                queue_iter(directories), app.threads, dir_done)
-#
-#        l.info("Creating Directories")
-#        mkdir = None
-#        workers.map_async(mkdir, queue_iter(mkdirs), app.threads)
-#    else:
-#        directories.get_nowait()
-#
-#    if files.qsize() > 1:
-#        l.info("Processing files")
-#        file_done = IterUnwrap(threaded_done_marker, uploads)
-#        process_files = None
-#        file_proc = workers.map_async(process_files,
-#                queue_iter(files), 2, file_done)
-#
-#    else:
-#        directories.get_nowait()
-#
-#    l.info("Waiting to process files")
-#
-#    #TODO wait for processing to finish
-#    while file_proc or dir_proc or upload_proc:
-#        l.info("Waiting for processing")
-#        if file_proc:
-#            try:
-#                file_res = file_proc.wait(1)
-#                file_proc.successful()
-#            except (TimeoutError, AssertionError):
-#                l.info("Still processing files")
-#            else:
-#                l.info("Done processing files")
-#                file_proc = None
-#                if isinstance(file_res, Exception):
-#                    raise
-#
-#        if dir_proc:
-#            try:
-#                dir_res = dir_proc.wait(1)
-#            except TimeoutError:
-#                l.info("Still processing directories")
-#            else:
-#                l.info("Done processing directories")
-#                dir_proc = None
-#                if isinstance(dir_res, Exception):
-#                    raise
-#
-#        if upload_proc:
-#            try:
-#                upload_proc.wait(1)
-#                upload_proc.successful()
-#            except (TimeoutError, AssertionError):
-#                l.info("Still processing uploads")
-#            else:
-#                l.info("Done processing uploads")
-#                upload_proc = None
-#        elif uploads.qsize() > 0:
-#            process_uploads =
-#            l.info("Starting uploader")
-#            upload_proc = workers.map_async(process_uploads,
-#                    queue_iter(uploads), app.threads)
-#            l.info("This didn't run right away")
-    l.info("Exiting")
-    sys.exit(0)
-    # After the readers have all exited, we know that remote_objects
-    # contains the remaining files that should be deleted from
-    # the backups.  Dump these into a Queue for the writers to take
-    # care of.
-    workers.close()
-
-    while (uploads.qsize() + mkdirs.qsize() + deletes.qsize()) > 0:
-        l.info("Actions remaining:- uploading:%d mkdir:%d deletes:%d",
-            directories.qsize(),
-            files.qsize(),
-            deletes.qsize(),
-        )
-        time.sleep(1)
-    l.info("Cleaning up, letting pending items finish %d",
-            (uploads.qsize() + mkdirs.qsize() + deletes.qsize()))
-    workers.join()
+    return work
 
 
 def process_directory(directory, app, remote_objects, mkdirs):
@@ -649,180 +569,57 @@ def process_directory(directory, app, remote_objects, mkdirs):
     if safe_dir in remote_objects and \
         remote_objects[safe_dir].get('content_type', None) == \
        'application/directory':
-        del remote_objects[safe_dir]
-        return
-
-    if safe_dir in remote_objects:
-        del remote_objects[safe_dir]
-
-    mkdirs.put(safe_dir)
-
-
-def create_directory(safe_dir, app):
-    l = logging.getLogger("create_directory")
-    l.info("Creating %s", safe_dir)
-
-    container = get_container(app)
-    obj = container.storage_object(safe_dir)
-    obj.content_type = 'application/directory'
-    obj.create()
-
-
-def delete_file(obj, app, jobs):
-    l = logging.getLogger("delete_file")
-    l.info("Deleting %s", obj['name'])
-
-    try:
-        # Copy the file out of the way
-        new_revision(app, obj['name'], obj.get('hash', 'deleted'))
-
-        # then delete it as it no longer exists.
-        rm = get_container(app).storage_object(obj['name'])
-        rm.delete()
-    except Exception, e:
-        l.error("Failed to delete %s, requeueing. Error: %s", obj['name'], e)
-        jobs.put(obj)
-        # in case we got disconnected, reset the container
-        app.authenticate()
-
-
-def process_file(_file, app, objects, backlog):
-    l = logging.getLogger('process_file')
-
-    safe_filename = encode_filename(_file)
-
-    # don't bother with checksums for new files
-    if safe_filename not in objects:
-        l.debug("Queued missing %s", safe_filename)
-        backlog.put((_file, safe_filename,))
-        return True
-
-    def _do_timesize():
-        oldsize = int(objects[safe_filename].get('size'))
-        cursize = int(get_filesize(_file))
-        curdate = int(os.path.getmtime(_file))
-        oldtime = objects[safe_filename].get('last_modified')
-
-        # there are a few formats, try to figure out which one safely
-        oldtime = try_datetime_parse(oldtime)
-        if oldtime is None:
-            l.warn("Failed to figure out the time format, skipping %s", _file)
-            return False
-
-        if cursize == oldsize and oldtime >= curdate:
-            l.debug("No change in filesize/date: %s", _file)
-            del objects[safe_filename]
-            return False
-
-        l.debug("Revised: SIZE:%s:%s DATE:%s:%s FILE:%s",
-                oldsize, cursize, oldtime, curdate, safe_filename)
-        return True
-
-    def _do_checksum():
-        l.debug("Checksumming %s", _file)
-
-        oldhash = objects[safe_filename]['hash']
-        newhash = swifthash(_file)
-
-        if oldhash == newhash:
-            l.debug("No change in checksum: %s", _file)
-            del objects[safe_filename]
-            return False
-
-        l.debug("Revised: HASH:%s:%s FILE:%s", oldhash, newhash, safe_filename)
-        return True
-
-    compare = _do_timesize
-    if app.checkhash:
-        compare = _do_checksum
-
-    try:
-        if compare():
-            # make a new copy, retention is handled there.  Start uploading
-            # and then remove it so it doesn't get deleted
-            new_revision(app, _file, objects[safe_filename]['hash'])
-            backlog.put((_file, safe_filename,))
-            del objects[safe_filename]
-
-    except (OSError, IOError), e:
-        l.error("Couldn't read file size skipping, %s: %s", _file, e)
-        # Just because we can't read it doesn't mean we dont' have
-        # the permission, it could be a medium error in which case
-        # don't delete the file, remote it from the remote object
-        # so it doesn't get marked for deletion
-        del objects[safe_filename]
         return False
 
-
-def new_revision(app, _from, marker):
-    l = logging.getLogger("new_revision")
-    if app.retention < 1:
-        l.warn("Retention disabled for %s", _from)
-        return None
-
-    # copy the file to the -revisions container so we don't
-    # pollute the deleted items list.  Not putting revisions
-    # in a seperate container will lead to an ever growing
-    # list slowing down the backups
-
-    _rev_container = "%s-revisions" % app.container
-
-    safe_filename = encode_filename(_from)
-    fs = os.path.splitext(safe_filename)
-    new_file = fs[0] + "_" + marker + fs[1]
-
-    container = get_container(app)
-    revcontainer = get_container(app, name=_rev_container)
-    revcontainer.create()
-
-    obj = container.storage_object(safe_filename)
-    rev = revcontainer.storage_object(new_file)
-
-    if obj.exists():
-        l.debug("Copying %s to %s", obj.name, rev.name)
-
-        rev.create()
-
-        obj.copy_to(rev)
-        delete_later(rev, app)
+    return True
 
 
-def delete_later(obj, app):
-    """ lacking this in the bindings currently, work around it.
-        Deletes a file after the specified number of days
-    """
-    l = logging.getLogger("delete_later")
-    delta = int(app.retention) * 24 * 60 * 60
-    when = int(time.time()) + delta
-    l.debug("Setting retention(%d) on %s", when, obj.name)
+def upload_directory(app):
+    """ Uploads an entire local directory. """
+    manager = Manager()
+    directories = manager.list()
+    files = manager.list()
+    remote_objects = manager.dict()
 
-    headers = {
-        'X-Delete-At': str(when),
-        'Content-Length': '0'}
-    obj.make_request('POST', headers=headers)
+    app.authenticate()
 
+    logging.debug("%s %s", app.token, app.url)
 
-def upload_file(job, app, jobs):
-    l = logging.getLogger('upload_file')
-    container = get_container(app)
+    logging.info("Starting harvesters")
+    local = Process(target=catalog_directory,
+            args=(app, files, directories,))
+    remote = Process(target=catalog_remote,
+        args=(app, remote_objects,))
 
-    # job is a tuple
-    _file, target = job
+    remote.start()
+    local.start()
 
-    try:
-        obj = container.storage_object(target)
-        l.info("Uploading file %s", obj.name)
-        chunk_upload(obj, _file)
-        l.debug("Finished file %s ", obj.name)
-    except (OSError, IOError), e:
-        # For some reason we couldn't read the file, skip it but log it
-        l.error("Failed to upload %s. %s", _file, e)
-    except Exception, e:
-        l.error("Failed to upload %s, requeueing. Error: %s", _file, e)
-        jobs.put((_file, target,))
-        # in case we got disconnected, reset the container
-        app.authenticate()
-        container = get_container(app)
+    logging.info("Waiting for harvest")
+    local.join()
+    remote.join()
+
+    backlog = delta_force_one(files, directories, remote_objects)
+
+    logging.debug("Backlog: %s", backlog)
+    if app.threads:
+        p = Pool(processes=app.threads, initializer=init_worker)
+        # remove client property as it can't be pickled
+        app.client = None
+        try:
+            rs = p.map_async(app, backlog, 1)
+            p.close()
+            rs.wait()
+            if not rs.successful():
+                raise rs.get()
+            p.join()
+        except KeyboardInterrupt:
+            logging.info("Trying to stop...")
+            p.terminate()
+            p.join()
+    else:
+        map(app, backlog)
+
+    logging.info("Done backing up %s to %s", app.source, app.container)
 
 
 if __name__ == "__main__":
