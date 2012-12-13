@@ -631,7 +631,7 @@ def upload_directory(app):
     directories = manager.list()
     files = manager.list()
     remote_objects = manager.dict()
-    exit_code = 1
+    exit_code = 0
 
     app.authenticate()
 
