@@ -18,7 +18,6 @@ import time
 import logging
 import logging.config
 import ConfigParser
-import signal
 from copy import copy
 from hashlib import md5
 from multiprocessing import Pool, cpu_count, Process
@@ -42,6 +41,10 @@ except ImportError:
         return 4 * 1024
     resource = object()
     resource.getpagesize = default_page
+
+
+class KeyboardInterruptError(Exception):
+    pass
 
 
 class Application(object):
@@ -249,8 +252,7 @@ class Application(object):
         _rev_container = "%s-revisions" % self.container
 
         safe_filename = encode_filename(_from)
-        fs = os.path.splitext(safe_filename)
-        new_file = fs[0] + "_" + marker + fs[1]
+        new_file = safe_filename + "/" + marker
 
         container = self.get_container()
         revcontainer = self.get_container(name=_rev_container)
@@ -260,7 +262,7 @@ class Application(object):
         rev = revcontainer.storage_object(new_file)
 
         if obj.exists():
-            l.debug("Copying %s to %s", obj.name, rev.name)
+            l.info("Copying %s to %s", obj.name, rev.name)
             rev.create()
             obj.copy_to(rev)
             self.delete_later(rev)
@@ -407,9 +409,26 @@ class Application(object):
         # the file doesn't need backing up, remove it just the same
         return upload_file
 
-    def __call__(self, item):
-        work, job = item
+    def process_directory(self, job):
+        try:
+            _dir, obj = job
+        except ValueError:
+            raise ValueError("Job not a tuple")
 
+        if obj.get('content_type', None) == 'application/directory':
+            logging.info("Skipping %s", _dir)
+            return False
+
+        logging.info("%s: ", obj.get('content_type'))
+        return True
+
+    def __call__(self, item):
+        try:
+            self._worker(*item)
+        except KeyboardInterrupt:
+            raise KeyboardInterruptError()
+
+    def _worker(self, work, job):
         self._setup_client()
 
         if self.url:
@@ -426,6 +445,10 @@ class Application(object):
             rt = self.process_file(job)
             if rt:
                 rt = self.upload_file(job[0])
+        elif work == 'dstat':
+            rt = self.process_directory(job)
+            if rt:
+                rt = self.create_directory(job[0])
         elif work == 'delete':
             rt = self.delete_file(job)
         elif work == 'mkdir':
@@ -439,10 +462,6 @@ class Application(object):
             logging.debug("%s for %s returned %s", work, job['name'], rt)
         else:
             logging.debug("%s for %s returned %s", work, job, rt)
-
-
-def init_worker():
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def get_filesize(_f):
@@ -552,26 +571,17 @@ def delta_force_one(files, directories, remote_objects):
     work = zip(repeat('upload'), f - r) + \
            zip(repeat('mkdir'), d - r)
 
+    for st in (f & r):
+        work.append(('stat', (st, remote_objects[st],),))
+
+    for sd in (d & r):
+        work.append(('dstat', (sd, remote_objects[st],),))
+
     # add the remote object directly to the delete queue
     for dl in (r - a):
         work.append(('delete', remote_objects[dl],))
 
-    for st in (a & r):
-        work.append(('stat', (st, remote_objects[st],),))
-
     return work
-
-
-def process_directory(directory, app, remote_objects, mkdirs):
-    _dir = directory
-    safe_dir = encode_filename(_dir)
-
-    if safe_dir in remote_objects and \
-        remote_objects[safe_dir].get('content_type', None) == \
-       'application/directory':
-        return False
-
-    return True
 
 
 def upload_directory(app):
@@ -602,7 +612,7 @@ def upload_directory(app):
 
     logging.debug("Backlog: %s", backlog)
     if app.threads:
-        p = Pool(processes=app.threads, initializer=init_worker)
+        p = Pool(processes=app.threads)
         # remove client property as it can't be pickled
         app.client = None
         try:
@@ -615,7 +625,6 @@ def upload_directory(app):
         except KeyboardInterrupt:
             logging.info("Trying to stop...")
             p.terminate()
-            p.join()
     else:
         map(app, backlog)
 
