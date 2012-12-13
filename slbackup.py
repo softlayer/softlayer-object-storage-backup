@@ -32,6 +32,7 @@ except ImportError:
     print "  or pip install softlayer-object-storage"
     sys.exit(1)
 
+
 try:
     import resource
 except ImportError:
@@ -44,6 +45,10 @@ except ImportError:
 
 
 class KeyboardInterruptError(Exception):
+    pass
+
+
+class SkippedFile(Exception):
     pass
 
 
@@ -308,9 +313,11 @@ class Application(object):
         except (OSError, IOError), e:
             # For some reason we couldn't read the file, skip it but log it
             l.exception("Failed to upload %s. %s", _file, e)
+            raise SkippedFile(_file)
         except Exception, e:
             if failed:
                 l.error("Couldn't upload %s, skiping: %s", _file, e)
+                raise SkippedFile(_file)
             else:
                 l.error("Failed to upload %s, requeueing. Error: %s", _file, e)
                 # in case we got disconnected, reset the container
@@ -341,6 +348,7 @@ class Application(object):
                 return self.delete_file(obj, failed=True)
             else:
                 l.exception("Failed to upload %s. %s", obj['name'], e)
+                raise SkippedFile(obj['name'])
         else:
             return True
         return False
@@ -402,6 +410,7 @@ class Application(object):
                 upload_file = True
         except (OSError, IOError), e:
             l.error("Couldn't read file size skipping, %s: %s", _file, e)
+            raise SkippedFile(_file)
         # Just because we can't read it doesn't mean we don't have
         # the permission, it could be a medium error in which case
         # don't delete the file, remove it from the remote object dict
@@ -426,6 +435,12 @@ class Application(object):
             self._worker(*item)
         except KeyboardInterrupt:
             raise KeyboardInterruptError()
+        except SkippedFile:
+            return 1
+        except Exception, e:
+            return e
+
+        return 0
 
     def _worker(self, work, job):
         self._setup_client()
@@ -456,10 +471,7 @@ class Application(object):
         else:
             logging.fatal("Unknown work type: %s", work)
 
-        if isinstance(job, dict):
-            logging.debug("%s for %s returned %s", work, job['name'], rt)
-        else:
-            logging.debug("%s for %s returned %s", work, job, rt)
+        return rt
 
 
 def get_filesize(_f):
@@ -588,6 +600,7 @@ def upload_directory(app):
     directories = manager.list()
     files = manager.list()
     remote_objects = manager.dict()
+    exit_code = 1
 
     app.authenticate()
 
@@ -619,14 +632,23 @@ def upload_directory(app):
             rs.wait()
             if not rs.successful():
                 raise rs.get()
+
             p.join()
+            codes = rs.get()
         except KeyboardInterrupt:
             logging.info("Trying to stop...")
             p.terminate()
+            return 130
     else:
-        map(app, backlog)
+        codes = map(app, backlog)
 
     logging.info("Done backing up %s to %s", app.source, app.container)
+
+    if any(codes):
+        logging.warn("Backup completed, but with errors. Check the log")
+        exit_code = 1
+
+    return exit_code
 
 
 if __name__ == "__main__":
@@ -723,4 +745,5 @@ if __name__ == "__main__":
 
     logging.config.fileConfig(opts.config)
     os.chdir(app.source)
-    upload_directory(app)
+    code = upload_directory(app)
+    sys.exit(code)
