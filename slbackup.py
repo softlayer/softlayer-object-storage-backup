@@ -416,10 +416,9 @@ class Application(object):
             raise ValueError("Job not a tuple")
 
         if obj.get('content_type', None) == 'application/directory':
-            logging.info("Skipping %s", _dir)
+            logging.debug("Skipping directory %s", _dir)
             return False
 
-        logging.info("%s: ", obj.get('content_type'))
         return True
 
     def __call__(self, item):
@@ -438,7 +437,6 @@ class Application(object):
             self.client.conn.auth.auth_token = self.token
 
         if not self.url or not self.token:
-            logging.warn("Invalid authentication")
             self.authenticate()
 
         if work == 'stat':
@@ -575,7 +573,7 @@ def delta_force_one(files, directories, remote_objects):
         work.append(('stat', (st, remote_objects[st],),))
 
     for sd in (d & r):
-        work.append(('dstat', (sd, remote_objects[st],),))
+        work.append(('dstat', (sd, remote_objects[sd],),))
 
     # add the remote object directly to the delete queue
     for dl in (r - a):
