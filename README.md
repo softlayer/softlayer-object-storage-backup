@@ -27,6 +27,19 @@ file comparisions are being performed.
 comparisions using this hash instead of time/size variance.
 * Open source - MIT licensed (as is the object storage library).
 
+
+Retention formats
+-----------------
+
+When specifying retention in the config file or _-r_ in the cli args, please be
+advised of the new time formats below:
+
+* time in days (1, 30, 15, etc)
+* time specific unit (1s, 50d, 5w, 2h, 40m)
+ * supported units: *s*econds, *m*inutes, *d*ays, *h*ours, *w*eeks
+ * *cannot* stack time units (1d10m) - calculate it if you need this
+
+
 Usage
 =====
 

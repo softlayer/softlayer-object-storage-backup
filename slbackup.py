@@ -135,7 +135,7 @@ class Application(object):
         self.dc = c.get('slbackup', 'datacenter')
         self.use_private = c.getboolean('slbackup', 'internal')
         self.checkhash = c.getboolean('slbackup', 'checksum')
-        self.retention = c.getint('slbackup', 'retention')
+        self.retention = c.get('slbackup', 'retention')
         self.threads = c.getint('slbackup', 'threads')
         self.excludes = []
         self.source = options.get('source')
@@ -194,6 +194,38 @@ class Application(object):
                 print "Token:", self.token
 
             sys.exit(0)
+
+    @property
+    def retention(self):
+        return self._retention
+
+    @retention.setter
+    def retention(self, value):
+        intval = None
+        unit = None
+
+        # see if they passed in just a numeric string
+        # if so, set it to the number of days
+        try:
+            intval = int(value)
+            unit = 'd'
+        except ValueError:
+            unit = value[-1]
+            intval = int(value[:-1])
+
+        units = {
+            's': 1,
+            'm': 60,
+            'h': 60 * 60,
+            'd': 24 * 60 * 60,
+            'w': 7 * 24 * 60 * 60,
+        }
+
+        if unit not in units:
+            raise ValueError("Invalid time value '%s'. Must be one of %s"
+                    % (unit, ', '.join(units.keys()),))
+
+        self._retention = units[unit] * int(intval)
 
     def try_datetime_parse(self, datetime_str):
         """
@@ -277,8 +309,7 @@ class Application(object):
             Deletes a file after the specified number of days
         """
         l = logging.getLogger("delete_later")
-        delta = int(self.retention) * 24 * 60 * 60
-        when = int(time.time()) + delta
+        when = int(time.time()) + self.retention
         l.debug("Setting retention(%d) on %s", when, obj.name)
 
         headers = {
@@ -689,7 +720,7 @@ if __name__ == "__main__":
         " configuration file."
         "Specifying them via the command line will override the config file")
 
-    oargs.add_option('-r', '--retention', nargs=1, type="int",
+    oargs.add_option('-r', '--retention', nargs=1, type="str",
             help='Days of retention to keep updated and deleted files.'
             ' This will create a backupContainer-revisions container.'
             ' Set to 0 to delete and overwrite files immediately.'
