@@ -52,7 +52,7 @@ class SkippedFile(Exception):
     pass
 
 
-class Application(object):
+class Swackup(object):
     _DEFAULT_RETENTION = 30
     _DEFAULT_CHECKHASH = False
     _DEFAULT_CONFIG = os.path.expanduser('~/.slbackup')
@@ -703,11 +703,11 @@ if __name__ == "__main__":
     args.add_option('-o', '--container', nargs=1, type="str",
             help='Container name to backup to.', metavar="backupContainer")
     args.add_option('-c', '--config', nargs=1, type="str",
-            default=Application._DEFAULT_CONFIG,
+            default=Swackup._DEFAULT_CONFIG,
             help='Configuration file containing login credintials.'
             ' Optional, but a configuration file must exist at %s' %
-                    Application._DEFAULT_CONFIG,
-                    metavar=Application._DEFAULT_CONFIG)
+                    Swackup._DEFAULT_CONFIG,
+                    metavar=Swackup._DEFAULT_CONFIG)
     args.add_option('--example', action="store_true", default=False,
             help="Print an example config and exit.")
 
@@ -724,32 +724,32 @@ if __name__ == "__main__":
             help='Days of retention to keep updated and deleted files.'
             ' This will create a backupContainer-revisions container.'
             ' Set to 0 to delete and overwrite files immediately.'
-            ' (default: %s)' % Application._DEFAULT_RETENTION,
-            metavar=Application._DEFAULT_RETENTION)
+            ' (default: %s)' % Swackup._DEFAULT_RETENTION,
+            metavar=Swackup._DEFAULT_RETENTION)
 
     oargs.add_option('-t', '--threads', nargs=1, type="int",
             help='Number of threads to spawn.'
             'The number spawned will be two times this number.'
             'If in doubt, the default of %d will be used, resulting'
             'in %d threads on this system.' % (
-                Application._DEFAULT_THREADS,
-                Application._DEFAULT_THREADS * 2),
-                metavar=Application._DEFAULT_THREADS)
+                Swackup._DEFAULT_THREADS,
+                Swackup._DEFAULT_THREADS * 2),
+                metavar=Swackup._DEFAULT_THREADS)
 
     oargs.add_option('-z', '--checksum', action='store_true',
             help='Use md5 checksums instead of time/size comparison. '
-            '(default: %s)' % Application._DEFAULT_CHECKHASH)
+            '(default: %s)' % Swackup._DEFAULT_CHECKHASH)
 
     oargs.add_option('-d', '--datacenter', nargs=1, type='str',
             help="Datacenter of the container. "
             "A container will be created if it doesn't exist. "
-            "(default: %s)" % Application._DEFAULT_DC,
-            metavar=Application._DEFAULT_DC)
+            "(default: %s)" % Swackup._DEFAULT_DC,
+            metavar=Swackup._DEFAULT_DC)
 
     oargs.add_option('-i', '--internal', action='store_true',
             help="Use SoftLayer's backend swift endpoint. "
             "Saves bandwidth if using it within the softlayer network. "
-            "(default: %s)" % Application._DEFAULT_USE_PRIVATE)
+            "(default: %s)" % Swackup._DEFAULT_USE_PRIVATE)
 
     xargs = optparse.OptionGroup(args, "Exclusion options",
         "Exclude particular directories.  DO NOT include the trailin slash!"
@@ -766,7 +766,7 @@ if __name__ == "__main__":
     args.add_option_group(xargs)
     (opts, extra) = args.parse_args()
 
-    app = Application(opts)
+    app = Swackup(opts)
 
     if not hasattr(opts, 'source') or not opts.source:
         args.error("Missing parameter: --source")
