@@ -140,6 +140,7 @@ class Swackup(object):
         self.excludes = []
         self.source = options.get('source')
         self.container = options.get('container')
+        self.prefix = options.get('prefix', '')
 
         self.auth_url = None
         self.token = None
@@ -274,6 +275,9 @@ class Swackup(object):
             name = self.container
 
         return self.client[name]
+
+    def get_object_name(self, name):
+        return "%s%s" % (self.prefix, name)
 
     def new_revision(self, _from, marker):
         l = logging.getLogger("new_revision")
@@ -607,6 +611,7 @@ def delta_force_one(files, directories, remote_objects):
     d = set(directories)
     r = set(remote_objects.keys())
     a = set(files + directories)
+
     # FIXME patchup file and directory names for comparison
 
     work = zip(repeat('upload'), f - r) + \
@@ -690,13 +695,7 @@ if __name__ == "__main__":
     args = optparse.OptionParser(
         'slbackup -s PATH -o CONTAINER [....]'
         "\n\n"
-        'SoftLayer rsync-like object storage backup script',
-        epilog="WARNING: this script uses mutliprocessing from python to "
-        "reduce high latency HTTP round trip times."
-        "It spawns on local file reader per thread (-t) and on "
-        "uploader/deleter for every 2 readers."
-        "Take this into consideration when specifying the -t option "
-        "as the number is essentially doubled.")
+        'SoftLayer rsync-like object storage backup script')
 
     args.add_option('-s', '--source', nargs=1, type="str",
             help='The directory to backup', metavar="/home")
@@ -761,6 +760,12 @@ if __name__ == "__main__":
     xargs.add_option("--xf", "--exclude-from", nargs=1,
             type="str", default=None, metavar="FILE",
             help="File including a line seperated list of directories.")
+
+    xargs.add_option("--prefix", "-p", nargs=1,
+            type="str", default='', metavar="some/path/",
+            help="Prefix all objects with speficied string.  "
+            "Make sure to include the trailing slash but not the leading one. "
+            "i.e --prefix static/imgs/ or --prefix some:pre:fix:")
 
     args.add_option_group(oargs)
     args.add_option_group(xargs)
