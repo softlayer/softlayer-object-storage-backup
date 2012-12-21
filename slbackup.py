@@ -30,7 +30,7 @@ except ImportError:
     print "ERROR: You need the latest object storage bindings from github:"
     print "  https://github.com/softlayer/softlayer-object-storage-python"
     print "  or pip install softlayer-object-storage"
-    sys.exit(1)
+    object_storage = None
 
 
 try:
@@ -325,10 +325,10 @@ class Swackup(object):
         l = logging.getLogger("create_directory")
 
         safe_dir = encode_filename(item)
-        l.info("Creating %s", safe_dir)
+        l.info("Creating %s", self.get_object_name(safe_dir))
 
         container = app.get_container()
-        obj = container.storage_object(safe_dir)
+        obj = container.storage_object(self.get_object_name(safe_dir))
         obj.content_type = 'application/directory'
         obj.create()
 
@@ -338,7 +338,7 @@ class Swackup(object):
         l = logging.getLogger('upload_file')
         container = self.get_container()
 
-        target = encode_filename(_file)
+        target = self.get_object_name(encode_filename(_file))
 
         try:
             obj = container.storage_object(target)
@@ -441,7 +441,7 @@ class Swackup(object):
             if compare():
                 # make a new copy, retention is handled there.  Start uploading
                 # and then remove it so it doesn't get deleted
-                self.new_revision(_file, obj['hash'])
+                self.new_revision(obj['name'], obj['hash'])
                 upload_file = True
         except (OSError, IOError), e:
             l.error("Couldn't read file size skipping, %s: %s", _file, e)
@@ -606,21 +606,33 @@ def catalog_remote(app, objects):
     logging.info("Objects %d", len(objects))
 
 
-def delta_force_one(files, directories, remote_objects):
-    f = set(files)
-    d = set(directories)
+def delta_force_one(files, directories, remote_objects, prefix=''):
+    fmt = "%s%%s" % prefix
+
+    file_prefixes = dict(zip((fmt % encode_filename(d) for d in files), files))
+    dir_prefixes = dict(zip((fmt % encode_filename(d) for d in directories), directories))
+    prefixes = {}
+    prefixes.update(file_prefixes)
+    prefixes.update(dir_prefixes)
+
+    f = set(file_prefixes.keys())
+    d = set(dir_prefixes.keys())
     r = set(remote_objects.keys())
-    a = set(files + directories)
+    a = set(list(f) + list(d))
 
-    # FIXME patchup file and directory names for comparison
+    work = []
+    #work = zip(repeat('upload'), f - r) + \
+           #zip(repeat('mkdir'), d - r)
 
-    work = zip(repeat('upload'), f - r) + \
-           zip(repeat('mkdir'), d - r)
+    work += zip(repeat('upload'),
+        dict((k, prefixes[k]) for k in (f - r)).values())
+    work += zip(repeat('mkdir'),
+        dict((k, prefixes[k]) for k in (d - r)).values())
 
-    for st in (f & r):
+    for st in dict((k, prefixes[k]) for k in (f & r)).values():
         work.append(('stat', (st, remote_objects[st],),))
 
-    for sd in (d & r):
+    for sd in dict((k, prefixes[k]) for k in (d & r)).values():
         work.append(('dstat', (sd, remote_objects[sd],),))
 
     # add the remote object directly to the delete queue
@@ -655,7 +667,8 @@ def upload_directory(app):
     local.join()
     remote.join()
 
-    backlog = delta_force_one(files, directories, remote_objects)
+    backlog = delta_force_one(files, directories, remote_objects,
+            prefix=app.prefix)
 
     logging.debug("Backlog: %s", backlog)
     if app.threads:
@@ -689,6 +702,9 @@ def upload_directory(app):
 
 if __name__ == "__main__":
     import optparse
+
+    if not object_storage:
+        sys.exit(1)
 
     # using argparse would have been preferred but that requires python >=2.7
     # ideally this will work in 2.5, but certianly 2.6
