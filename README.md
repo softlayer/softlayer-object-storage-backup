@@ -1,6 +1,8 @@
 softlayer-object-storage-backup
 ===============================
 
+*You can now install from pip!*  `pip install slbackup`
+
 SoftLayer's object storage backup script.
 
 This script is indended to be used purely as a backup operation!
