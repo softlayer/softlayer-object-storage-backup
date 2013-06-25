@@ -166,7 +166,7 @@ class Swackup(object):
 
         if options.get('retention', None) is not None:
             self.retention = options['retention']
-            logging.warn("Override: Setting retention days to %d",
+            logging.warn("Override: Setting retention seconds to %d",
                     self.retention)
 
         if options.get('threads', None) is not None:
@@ -310,7 +310,7 @@ class Swackup(object):
 
     def delete_later(self, obj):
         """ lacking this in the bindings currently, work around it.
-            Deletes a file after the specified number of days
+            Deletes a file after the specified number of seconds.
         """
         l = logging.getLogger("delete_later")
         when = int(time.time()) + self.retention
