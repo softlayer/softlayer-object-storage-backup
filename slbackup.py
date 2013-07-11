@@ -6,7 +6,7 @@ __author__ = "Kevin Landreth"
 __copyright__ = "Copyright 2012, SoftLayer"
 __credits__ = ["Kevin Landreth", "Kevin McDonald", "Chris Evans"]
 __license__ = "MIT"
-__version__ = "2.0"
+__version__ = "2.1"
 __maintainer__ = "Kevin Landreth"
 __email__ = "klandreth@softlayer.com"
 __status__ = "Production"
@@ -446,11 +446,6 @@ class Swackup(object):
         except (OSError, IOError), e:
             l.error("Couldn't read file size skipping, %s: %s", _file, e)
             raise SkippedFile(_file)
-        # Just because we can't read it doesn't mean we don't have
-        # the permission, it could be a medium error in which case
-        # don't delete the file, remove it from the remote object dict
-        # so it doesn't get marked for deletion later on.  Even if
-        # the file doesn't need backing up, remove it just the same
         return upload_file
 
     def process_directory(self, job):
@@ -471,6 +466,11 @@ class Swackup(object):
         except KeyboardInterrupt:
             raise KeyboardInterruptError()
         except SkippedFile:
+            # Just because we can't read it doesn't mean we don't have
+            # the permission, it could be a medium error in which case
+            # don't delete the file, remove it from the remote object dict
+            # so it doesn't get marked for deletion later on.  Even if
+            # the file doesn't need backing up, remove it just the same
             return 1
         except Exception, e:
             return e
@@ -607,39 +607,59 @@ def catalog_remote(app, objects):
 
 
 def delta_force_one(files, directories, remote_objects, prefix=''):
-    fmt = "%s%%s" % prefix
+    fmt = "%s%%s" % prefix  # leave a %s in there for below
 
+    # pre-encode these keys because that is done during upload as well
+    # this also makes sure that the appropriate backup prefixes are added
     file_prefixes = dict(zip((fmt % encode_filename(d) for d in files), files))
-    dir_prefixes = dict(zip((fmt % encode_filename(d) for d in directories), directories))
-    prefixes = {}
-    prefixes.update(file_prefixes)
-    prefixes.update(dir_prefixes)
+    dir_prefixes = dict(zip((fmt % encode_filename(d) for d in directories),
+        directories))
+    prefixed_local = {}
+    prefixed_local.update(file_prefixes)
+    prefixed_local.update(dir_prefixes)
 
-    f = set(file_prefixes.keys())
-    d = set(dir_prefixes.keys())
-    r = set(remote_objects.keys())
-    a = set(list(f) + list(d))
+    file_prefixes = set(file_prefixes.keys())
+    directory_prefixes = set(dir_prefixes.keys())
+    remote_prefixes = set(remote_objects.keys())
+    local_file_dir_set = set(list(file_prefixes) + list(directory_prefixes))
 
     work = []
-    #work = zip(repeat('upload'), f - r) + \
-           #zip(repeat('mkdir'), d - r)
 
+    # compose a list containing tuples containing:
+    # ( work type, args)
+    # some work types need more args so they are # included in a 2nd tuple:
+    # ( work type, (arg, arg),)
+
+    # Upload new files - skips comparison checking
+    # made from the elements in file_prefixes, but not remote_objects
     work += zip(repeat('upload'),
-        dict((k, prefixes[k]) for k in (f - r)).values())
-    work += zip(repeat('mkdir'),
-        dict((k, prefixes[k]) for k in (d - r)).values())
+        dict((k, prefixed_local[k]) for k in (
+            file_prefixes - remote_prefixes)).values())
 
-    for st in dict((k, prefixes[k]) for k in (f & r)).values():
+    # Create new directories
+    # made from the elements in directory_prefixes and not remote_objects
+    work += zip(repeat('mkdir'),
+        dict((k, prefixed_local[k]) for k in (
+            directory_prefixes - remote_prefixes)).values())
+
+    # Files to be checked
+    # made from the items appearing in both sets
+    for st in dict((k, prefixed_local[k]) for k in (
+        file_prefixes & remote_prefixes)).values():
         work.append(('stat', (st, remote_objects[st],),))
 
-    for sd in dict((k, prefixes[k]) for k in (d & r)).values():
+    # Directories to be checked
+    # made from the items appearing in both sets
+    for sd in dict((k, prefixed_local[k]) for k in (
+        directory_prefixes & remote_prefixes)).values():
         work.append(('dstat', (sd, remote_objects[sd],),))
 
-    # add the remote object directly to the delete queue
-    for dl in (r - a):
+    # if a remote object doesn't appear locally
+    # add the remote object to the delete queue
+    for dl in (remote_prefixes - local_file_dir_set):
         work.append(('delete', remote_objects[dl],))
 
-    return work
+    return work[:]  # Copy of the list
 
 
 def upload_directory(app):
