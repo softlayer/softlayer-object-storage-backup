@@ -24,9 +24,9 @@ Features
 * Whole file delta backups - only changed/new files are uploaded saving you time/bandwidth.
 * Retention policies - deleted/updated files are kept for any desired length of time.  These can also be disabled.
 * Threaded - Copying can always be the longest part, so backups are done in the background as 
-file comparisions are being performed.
+file comparisons are being performed.
 * MD5 support - Swift automatically sets a default hash (md5) for every object.  We support file
-comparisions using this hash instead of time/size variance.
+comparisons using this hash instead of time/size variance.
 * Open source - MIT licensed (as is the object storage library).
 
 
@@ -63,7 +63,7 @@ Known issues/limitations
 with production systems.
 * 5GB file limitation: Swift does support [large files](http://swift.openstack.org/overview_large_objects.html) 
 using Manifest files, but this script does not currently deal with this properly.  Not sure how to deal with
-object fragments during file comparision.  Uploading and making the manifests is easy.
+object fragments during file comparison.  Uploading and making the manifests is easy.
 * Windows Support:  Tried to write the script in a way that supported windows.  However, it is not tested yet.
 * Restoration: Restoring files is an operation left to the admin right now. 
 [FUSE is handy](https://github.com/redbo/cloudfuse) for that kind of work.
